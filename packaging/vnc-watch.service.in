@@ -1,0 +1,19 @@
+[Unit]
+Description=vnc-watch (best-effort remote-viewing detection)
+Documentation=file:@DOC@
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=@PYTHON@ -u @EXEC@ watch --input-watch
+Environment=VNC_WATCH_LOCK_FILE=@LOCKFILE@
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/.local/state/vnc-watch/vnc-watch.out
+StandardError=append:%h/.local/state/vnc-watch/vnc-watch.out
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,402 @@
+# vnc-watch
+
+An unprivileged, best-effort detector for someone viewing or controlling your
+desktop session through VNC or RDP — with a popup that can cut the session and
+wipe local traces, and optional out-of-band alerts to Discord, Telegram, ntfy
+or WhatsApp.
+
+It is a single Python file. No root, no packages, no kernel modules.
+
+---
+
+## What it does
+
+- Watches for **VNC/RDP listeners and live connections** (`:5900`–`:5903`,
+  `:3389`, `:11100`) and classifies them from the RFB protocol log when one is
+  available.
+- Watches for **new login sessions** (`/var/run/utmp` + `loginctl`), so an SSH
+  or console login by someone else is reported even if they never touch VNC.
+- Shows a **desktop notification** and an optional **action window** with three
+  choices when a remote session appears.
+- Can **close the VNC server** (`XKillClient` via the X-Resource extension) or
+  stop your own `gnome-remote-desktop` service.
+- Can **wipe browser and Discord traces** on demand.
+- Can **push every alert off the machine** to a channel you control, so the
+  log survives if the session is tampered with.
+- Provides `lockdown`: close remote access and lock the screen, on a hotkey.
+
+## What it does not do
+
+This matters more than the feature list. Read it before trusting the tool.
+
+- **It cannot see a root-level viewer that hides itself.** `x11vnc -quiet`,
+  log truncation, a different VNC implementation, `/dev/fb0` reads or
+  `XGetImage` grabs are invisible to it.
+- **It cannot revoke only the remote mouse and keyboard.** VNC injects through
+  the XTEST device and the X server refuses to let an unprivileged client
+  disable that device (`BadAccess`). XTEST input is deliberately
+  indistinguishable from real input. The only real control is ending the
+  session (or locking it).
+- **`kick` ends the whole VNC server**, not one viewer. X11 has no
+  per-connection disconnect.
+- **X-level features need Xorg.** Under Wayland you still get socket
+  detection, login alerts, RDP service control and screen locking; VNC
+  eviction and the XTEST signal do not apply.
+- **A root operator on the machine can read your channel credentials**, post
+  to your channel, or block outbound traffic. Remote alerts raise the cost of
+  quiet access; they do not make you invisible.
+
+---
+
+## Requirements
+
+| Need | Why | Without it |
+|---|---|---|
+| Linux, Python 3.8+ | the tool itself | — |
+| Xorg session | `kick`, XTEST signal | those features report "unavailable" |
+| systemd (user) | background daemon | run `vnc-watch watch` manually |
+| `libX11.so.6`, `libXRes.so.1` | X client → PID mapping | `kick` reports unavailable |
+| `xinput` | XTEST injection signal | that signal is skipped |
+| `gdbus` or `notify-send` | desktop notifications | silent |
+| `python3-gi` + GTK 3 | action window | window skipped, notification only |
+| readable `/var/run/utmp` | login detection | falls back to `loginctl` |
+
+Check what your machine has:
+
+```bash
+make check
+```
+
+Install:
+
+```bash
+make install
+```
+
+That creates `~/.local/bin/vnc-watch` (symlink), installs
+`~/.config/systemd/user/vnc-watch.service`, creates the state directory, and
+starts the daemon. Re-running `make install` is safe.
+
+Without systemd:
+
+```bash
+python3 vnc-watch.py watch --input-watch
+```
+
+---
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `vnc-watch watch` | run the detector (default command) |
+| `vnc-watch audit` | classify every connection in the current VNC log |
+| `vnc-watch portal` | one-shot screenshot/RDP/VNC status report |
+| `vnc-watch menu` | interactive menu of all actions |
+| `vnc-watch kick [--yes] [--dry-run]` | close a running VNC server |
+| `vnc-watch popup [--no-auto]` | open the action window manually |
+| `vnc-watch lockdown [--no-lock]` | close remote access and lock the screen |
+| `vnc-watch channels [--test] [--set K=V] [--clear K]` | configure remote alerts |
+| `vnc-watch shortcut [--remove] [--binding ...]` | install/remove the lockdown hotkey |
+
+Useful flags for `watch`:
+
+- `--input-watch` — also monitor XTEST injection (supporting signal only)
+- `--x-watch` — also monitor X client count (noisy, off by default)
+
+---
+
+## Detection confidence
+
+Tiers come from protocol evidence, never from "a human is watching":
+
+| Tier | Meaning |
+|---|---|
+| `CONFIRMED RFB SESSION` | RFB handshake completed (pixel format seen) |
+| `PROBABLE` | RFB version exchanged, no handshake |
+| `SUSPICIOUS` | socket held ≥ 10 s with no protocol evidence |
+| `INFO` | probe, instant connect/close, rejected websocket |
+
+Supporting signals that never change a tier: xdamage objects, x11vnc
+`client_count`, X client count, CPU use, autorepeat flips, XTEST events.
+
+---
+
+## The action window
+
+Triggered by a `CONFIRMED`/`PROBABLE` viewer or a new VNC/RDP connection:
+
+```
+Remote viewing detected
+VNC viewer attached
+203.0.113.9:49152 -> this machine's :5900
+
+Auto in 60 s: close the connection and wipe browser + Discord data.
+[ Close + wipe ] [ Keep connection, wipe data ] [ Do nothing ]
+```
+
+- **Close + wipe** — ends the VNC server (or stops `gnome-remote-desktop`),
+  then deletes browser and Discord data.
+- **Keep connection, wipe data** — leaves the viewer attached, removes stored
+  traces only.
+- **Do nothing** — explicit dismissal.
+- **No click within 60 s** — applies *Close + wipe* automatically.
+- Both destructive buttons ask a second confirmation; the timeout does not.
+
+> **This is destructive.** If you leave the window alone, it logs you out of
+> Discord and web apps and deletes history, cookies and caches. Tune or disable
+> it before relying on the tool:
+>
+> ```bash
+> VNC_WATCH_POPUP_TIMEOUT=120     # longer countdown
+> VNC_WATCH_POPUP_AUTO=0          # never act automatically
+> ```
+
+If the file named by `VNC_WATCH_LOCK_FILE` reports an active seat lock/exam
+window, the countdown is disabled and the window waits for you. The variable is
+unset by default, so on a normal machine the guard is inert and the automatic
+choice is enabled.
+
+The file is expected to be JSON with an optional `"locked": true` field and an
+optional `"intervals": [[start, end], ...]` list of Unix timestamps. Point the
+daemon at your institution's seat-state file only if you have one:
+
+```bash
+make install LOCKFILE=/run/seat-lock/seat0.json
+# or add Environment=VNC_WATCH_LOCK_FILE=/run/seat-lock/seat0.json to the unit
+```
+
+### What the wipe removes
+
+Per browser profile (Chrome, Chromium, Brave, Firefox — native and flatpak):
+`History`, `Cookies`, `Sessions`, `Session Storage`, `Local Storage`,
+`IndexedDB`, `Cache`, `Code Cache`, `GPUCache`, `Service Worker`,
+`places.sqlite`, `cookies.sqlite`, `sessionstore-backups`, `storage`,
+`cache2`, `startupCache`.
+
+Per Discord (`discord`, `discordcanary`, `discordptb`, `BetterDiscord`):
+`Cache`, `Code Cache`, `GPUCache`, `Local Storage`, `Session Storage`,
+`IndexedDB`, `logs`, `Network Persistent State`, `Service Worker`.
+
+Kept on purpose: bookmarks and saved passwords. Every removal is logged with
+its size. Paths outside your home are refused, symlinks are never followed
+out of it.
+
+---
+
+## Lockdown
+
+```bash
+vnc-watch lockdown          # evict remote access, then lock
+vnc-watch lockdown --no-lock
+```
+
+Bind **Ctrl+Alt+Shift+L** to it with:
+
+```bash
+make shortcut          # or: vnc-watch shortcut
+```
+
+That adds a GNOME custom shortcut (stored in dconf; no root). A physical
+keypress works even while someone else is injecting input. `make install` does
+not touch your keybindings.
+
+Remove or rebind:
+
+```bash
+vnc-watch shortcut --remove
+vnc-watch shortcut --binding '<Control><Alt><Shift>k'
+```
+
+The sequence is deliberate: eviction and locking happen locally first, and the
+network notification is sent only afterwards, so a slow webhook cannot delay
+the lock.
+
+---
+
+## Remote alerts
+
+Every alert is mirrored to each configured channel, which doubles as an
+off-machine copy of the log.
+
+```bash
+vnc-watch channels                 # show config (values masked)
+vnc-watch channels --test          # send a test message
+vnc-watch channels --set KEY=VALUE
+vnc-watch channels --clear KEY
+```
+
+Configuration lives in `~/.local/state/vnc-watch/channels.json` (mode 0600).
+See `examples/channels.json`.
+
+### ntfy.sh — easiest, no account
+
+```bash
+vnc-watch channels --set ntfy_topic=some-long-random-string
+vnc-watch channels --test
+```
+
+Subscribe to the same topic in the ntfy app. The topic name is the only
+secret; make it long and random.
+
+### Discord webhook
+
+Server → channel → Edit Channel → Integrations → Webhooks → New Webhook →
+Copy URL.
+
+```bash
+vnc-watch channels --set discord_webhook='https://discord.com/api/webhooks/...'
+vnc-watch channels --test
+```
+
+The webhook URL is a bearer credential: anyone holding it can post to your
+channel. Delete and recreate it if it leaks.
+
+### Telegram bot
+
+Message `@BotFather` → `/newbot` → token. Send the bot a message, then read
+your chat id from `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+
+```bash
+vnc-watch channels --set telegram_token=123456:ABC... --set telegram_chat=987654321
+```
+
+### WhatsApp (CallMeBot)
+
+Send `I allow callmebot to send me messages` on WhatsApp to
+`+34 644 51 95 23`; it replies with an API key.
+
+```bash
+vnc-watch channels --set whatsapp_phone=+15551234567 --set whatsapp_apikey=000000
+```
+
+Third-party relay: less private than ntfy or Telegram.
+
+### Your own endpoint
+
+Anything that accepts a JSON POST:
+
+```json
+{"title": "...", "text": "...", "host": "...", "user": "...", "time": "..."}
+```
+
+```bash
+vnc-watch channels --set webhook_url=https://your-server/hook
+```
+
+### What triggers a message
+
+- VNC/RDP connection opens, or a new listener appears on a watched port
+- `CONFIRMED`/`PROBABLE` viewer detection
+- New login session (utmp or loginctl), including `user@pts/N from host`
+- Actions taken: popup choice, connection closed, data wiped, lockdown
+
+---
+
+## Files
+
+```
+~/.local/bin/vnc-watch                        symlink created by make install
+~/.config/systemd/user/vnc-watch.service      user service
+~/.local/state/vnc-watch/
+    vnc-watch.log        alert log (also mirrored to your channels)
+    vnc-watch.out        daemon stdout/stderr
+    state.json           daemon -> menu snapshot
+    ack.json             menu acknowledgements (bookkeeping only)
+    channels.json        0600, remote alert credentials
+    xinput-xi2.log       XTEST dump, capped at 2 MB
+    popup.lock           keeps one action window open at a time
+```
+
+The state directory is created 0700 (so the files inside stay private
+regardless of their own mode); `channels.json` is 0600 and JSON writes are
+atomic. The alert log rotates once at 5 MB to `vnc-watch.log.1`, so it cannot
+grow without bound. A full or unwritable volume fails closed: writes are
+skipped with an error on stderr and the daemon keeps running, disabling only
+XTEST input-watch if its dump cannot be opened.
+
+---
+
+## Troubleshooting
+
+**Nothing happens / no daemon**
+
+```bash
+make status
+systemctl --user status vnc-watch
+tail -n 40 ~/.local/state/vnc-watch/vnc-watch.out
+```
+
+**`kick` says "no X client maps to this PID"**
+
+The X-Resource extension is missing or the server uses a display other than
+`:0`. Check `xdpyinfo | grep X-Resource`.
+
+**Action window never appears**
+
+GTK 3 for Python is missing (`make check`), or the daemon has no `DISPLAY`.
+It also refuses to open more than one window at a time, and at most one per
+120 s.
+
+**Discord returns `http 403 error code: 1010`**
+
+Cloudflare rejects Python's default User-Agent. This is already fixed in the
+code; if you see it again, your proxy or a newer block is involved. Test with
+`curl -H 'User-Agent: vnc-watch/1.0' ...`.
+
+**Wiped data came back**
+
+A running browser can re-flush databases from memory. Close browsers before
+relying on a wipe.
+
+**Daemon stopped with "Start request repeated too quickly"**
+
+It hit the restart limit after repeated failures (often a full disk):
+
+```bash
+systemctl --user reset-failed vnc-watch
+systemctl --user start vnc-watch
+```
+
+---
+
+## Uninstall
+
+```bash
+make uninstall      # stop and remove service + symlink, keep state
+make purge          # also delete ~/.local/state/vnc-watch
+vnc-watch shortcut --remove   # remove the hotkey
+```
+
+---
+
+## How it works
+
+- **Connections**: `ss`/`/proc/net/tcp` for live peers and listeners;
+  optional tailing of `/var/log/x11vnc.log` for RFB handshake evidence.
+- **X clients**: the X-Resource extension maps each X client to a PID
+  (`XResQueryClientIds`, mask bit 1). `XKillClient` on the VNC server's client
+  base ends its display connection.
+- **Logins**: fixed-offset parsing of the 384-byte `struct utmp`, plus
+  `loginctl list-sessions`.
+- **Notifications**: libnotify over D-Bus. **Action window**: GTK 3.
+- **Remote alerts**: `urllib` posts, queued on a daemon thread so a slow
+  endpoint cannot stall detection.
+
+Environment variables: `VNC_WATCH_POPUP_TIMEOUT`, `VNC_WATCH_POPUP_AUTO`,
+`VNC_WATCH_LOCK_FILE` (seat-lock guard; unset = disabled),
+`VNC_WATCH_XI_MAX`, `VNC_WATCH_LOG_MAX`, `VNC_WATCH_UTMP` (testing).
+
+---
+
+## Scope and ethics
+
+This is a personal privacy tool for **your own session on your own account**.
+It observes, and on request ends, remote access to the machine you are sitting
+at. It is not a monitoring tool for other people, and it should not be pointed
+at anyone else's session.
+
+Some of what it does — closing a service run by your institution, wiping data
+on a shared machine — may conflict with campus policy, even when the action is
+in your own account. Read your institution's rules before enabling the
+automatic actions, and prefer `VNC_WATCH_POPUP_AUTO=0` if you are unsure.

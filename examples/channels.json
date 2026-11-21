@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to ~/.local/state/vnc-watch/channels.json (mode 0600) or use `vnc-watch channels --set key=value`. Only fill in the ones you want; every configured channel receives every alert.",
+
+  "discord_webhook": "https://discord.com/api/webhooks/ID/TOKEN",
+
+  "telegram_token": "123456789:AA...",
+  "telegram_chat": "987654321",
+
+  "ntfy_topic": "change-me-to-a-long-random-string",
+  "ntfy_server": "https://ntfy.sh",
+
+  "whatsapp_phone": "+15551234567",
+  "whatsapp_apikey": "000000",
+
+  "webhook_url": "https://example.com/vnc-watch"
+}
