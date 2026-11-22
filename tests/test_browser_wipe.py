@@ -206,6 +206,64 @@ profs = M.discover_profiles(root, "firefox")
 check("firefox profiles.ini path", any(os.path.basename(p) ==
       "xyz.default-release" for p in profs), str(profs))
 
+print("\n== Snap roots: multiple firefox profiles ==")
+home = fresh_home("snap-ff")
+snap_root = os.path.join(home, "snap", "firefox", "common", ".mozilla",
+                         "firefox")
+os.makedirs(snap_root, exist_ok=True)
+for name in ("aaa.default-release", "bbb.default"):
+    make_firefox_profile(snap_root, name)
+with open(os.path.join(snap_root, "profiles.ini"), "w") as fh:
+    fh.write("[Profile0]\nName=a\nIsRelative=1\nPath=aaa.default-release\n"
+             "Default=1\n\n[Profile1]\nName=b\nIsRelative=1\n"
+             "Path=bbb.default\n")
+check("snap firefox root is a configured root",
+      "~/snap/firefox/common/.mozilla/firefox"
+      in [r for _l, r in M.BROWSER_ROOTS],
+      [r for _l, r in M.BROWSER_ROOTS if "snap" in r])
+profs = M.discover_profiles(snap_root, "firefox")
+check("snap firefox discovers both profiles",
+      {os.path.basename(p) for p in profs} ==
+      {"aaa.default-release", "bbb.default"}, str(profs))
+res = M.wipe_private_data(apply=True, allow_running=True)
+check("snap wipe: no errors", res["errors"] == [], str(res["errors"][:2]))
+for name in ("aaa.default-release", "bbb.default"):
+    base = os.path.join(snap_root, name)
+    check(f"snap {name}: cookies removed",
+          not os.path.exists(os.path.join(base, "cookies.sqlite")), base)
+    check(f"snap {name}: places.sqlite (bookmarks) preserved",
+          os.path.exists(os.path.join(base, "places.sqlite")), base)
+
+print("\n== GitHub-like session cookie removed, bookmarks preserved ==")
+home = fresh_home("github")
+cdir = os.path.join(home, ".config", "chromium", "Default")
+os.makedirs(cdir, exist_ok=True)
+cookies_db = os.path.join(cdir, "Cookies")
+con = sqlite3.connect(cookies_db)
+con.executescript(
+    "CREATE TABLE cookies(host_key TEXT, name TEXT, value TEXT,"
+    " encrypted_value BLOB, path TEXT, expires_utc INTEGER);"
+    "INSERT INTO cookies VALUES('github.com','user_session','tok',"
+    " x'deadbeef','/', 9999999999);"
+    "INSERT INTO cookies VALUES('github.com','logged_in','yes',"
+    " x'cafe','/', 9999999999);")
+con.commit()
+con.close()
+with open(os.path.join(cdir, "Bookmarks"), "wb") as fh:
+    fh.write(b'{"roots":{"bookmark_bar":{"children":[{"name":"gh"}]}}}')
+with open(os.path.join(cdir, "History"), "wb") as fh:
+    fh.write(b"history-bytes")
+res = M.wipe_private_data(apply=True, allow_running=True)
+check("github: Cookies database removed whole",
+      not os.path.exists(cookies_db), cdir)
+check("github: no cookie record survives",
+      not any(os.path.exists(p) for p in
+              (cookies_db, cookies_db + "-wal", cookies_db + "-shm")))
+check("github: Bookmarks preserved",
+      os.path.exists(os.path.join(cdir, "Bookmarks")))
+check("github: History removed",
+      not os.path.exists(os.path.join(cdir, "History")))
+
 print("\n== wipe: chromium-family + firefox (allow_running) ==")
 home = fresh_home("wipe")
 build_all(home, native=True, flatpak=True)

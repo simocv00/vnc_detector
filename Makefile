@@ -36,8 +36,8 @@ TRAYSERVICE := vnc-watch-tray.service
 TRAYBACKEND ?=
 
 .PHONY: help check install uninstall status logs restart stop start \
-        channels test test-fixtures popup-test shortcut lockdown xwatch \
-        audit menu run tray tray-stop clean purge panel-install \
+        channels test test-fixtures test-ssh popup-test shortcut lockdown \
+        xwatch audit ssh menu run tray tray-stop clean purge panel-install \
         panel-uninstall panel-restart panel-status
 
 help:
@@ -54,11 +54,13 @@ help:
 	@echo "  make shortcut     bind Ctrl+Alt+Shift+L to lockdown"
 	@echo "  make channels     show/edit remote alert channels"
 	@echo "  make test         send a test message to each channel"
-	@echo "  make test-fixtures  browser-wipe isolation tests (temp HOME)"
+	@echo "  make test-fixtures  isolation tests (browser wipe + SSH subsystem)"
+	@echo "  make test-ssh     SSH subsystem isolation tests (temp HOME)"
 	@echo "  make popup-test   preview the action window (no auto action)"
 	@echo "  make lockdown     close any VNC/RDP session and lock the screen"
 	@echo "  make xwatch       evict screen-capture tools on :0 (root included)"
 	@echo "  make audit        classify connections in the current VNC log"
+	@echo "  make ssh          SSH subsystem view (sessions, procs, wtmp, x11vnc)"
 	@echo "  make menu         interactive menu"
 	@echo "  make tray         run the tray icon in the foreground"
 	@echo "  make tray-stop    stop the tray service"
@@ -85,6 +87,10 @@ check:
 		|| echo "extmeta : gnome-extension/metadata.json missing or invalid"
 	@$(PYTHON) -c 'import importlib.util, sys; s=importlib.util.spec_from_file_location("vw", "$(SRC)"); m=importlib.util.module_from_spec(s); sys.argv=["vnc-watch"]; s.loader.exec_module(m); p=m.browser_config_ok(); print("browsers: OK") if not p else (print("browsers: FAIL " + "; ".join(p)) or sys.exit(1))'
 	@test -r /var/run/utmp && echo "utmp    : readable" || echo "utmp    : not readable (login detection disabled)"
+	@command -v loginctl >/dev/null 2>&1 && echo "ssh sess: loginctl present" || echo "ssh sess: loginctl missing (SSH session detection off)"
+	@command -v ss       >/dev/null 2>&1 && echo "ssh conn: ss present" || echo "ssh conn: ss missing (SSH connection detection off)"
+	@test -r /var/log/wtmp && echo "ssh wtmp: readable" || echo "ssh wtmp: not readable (remote-login history off)"
+	@test -r /var/log/auth.log && echo "ssh auth: auth.log readable (login method visible)" || echo "ssh auth: auth.log not readable (needs adm; method/key not read)"
 
 install: check
 	@mkdir -p "$(BINDIR)" "$(STATE)"
@@ -167,8 +173,14 @@ channels:
 test:
 	@$(LINK) channels --test
 
-test-fixtures:
+test-fixtures: test-ssh test-hardening
 	@$(PYTHON) tests/test_browser_wipe.py
+
+test-ssh:
+	@$(PYTHON) tests/test_ssh_detect.py
+
+test-hardening:
+	@$(PYTHON) tests/test_hardening.py
 
 popup-test:
 	@$(LINK) popup --no-auto --timeout 30 \
@@ -183,6 +195,9 @@ xwatch:
 
 audit:
 	@$(LINK) audit
+
+ssh:
+	@$(LINK) ssh
 
 menu:
 	@$(LINK) menu

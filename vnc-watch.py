@@ -8,6 +8,8 @@
     vnc-watch lockdown close remote access and lock the screen
     vnc-watch xwatch   evict screen-capture tools on :0 (root included)
     vnc-watch channels remote alerts (Discord / Telegram / ntfy / WhatsApp)
+    vnc-watch clear    delete browser + Discord data; --encrypt keeps an
+                       AES-256 archive instead, --restore brings one back
     vnc-watch menu     read the daemon's state and offer manual actions
     vnc-watch tray     top-bar icon: white when idle, red when a viewer is
                        attached; click for quick actions (clear browser +
@@ -63,7 +65,11 @@ import argparse
 import ast
 import collections
 import ctypes
+import errno
 import fcntl
+import hashlib
+import hmac
+import io
 import json
 import os
 import queue
@@ -72,15 +78,42 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+
+
+def _env_num(name, default, cast):
+    """Read a numeric env var without letting a typo kill the whole tool.
+
+    A malformed `VNC_WATCH_*` value (``5M``, empty string, negative) must not
+    raise at import time: that would disable audit, menu and watch alike. Fall
+    back to the documented default and say so on stderr once.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = cast(raw.strip())
+    except (TypeError, ValueError):
+        sys.stderr.write(f"vnc-watch: invalid {name}={raw!r}; "
+                         f"using default {default}\n")
+        return default
+    if isinstance(value, int) and value < 0:
+        sys.stderr.write(f"vnc-watch: invalid negative {name}={raw!r}; "
+                         f"using default {default}\n")
+        return default
+    return value
+
 
 LOG = "/var/log/x11vnc.log"
 
@@ -102,17 +135,22 @@ LEGACY_STATE = [
 WEAK_SECONDS = 10.0
 REMOTE_PORTS = {3389, 5900, 5901, 5902, 5903, 11100}
 # Overridable only so tests can exercise rotation without 2 MB of writes.
-XI_LOG_MAX = int(os.environ.get("VNC_WATCH_XI_MAX", 2 * 1024 * 1024))
+XI_LOG_MAX = _env_num("VNC_WATCH_XI_MAX", 2 * 1024 * 1024, int)
 # The alert log is rotated once when it exceeds this, keeping one `.1` backup,
 # so an unattended daemon cannot slowly fill a small home volume.
-ALERT_LOG_MAX = int(os.environ.get("VNC_WATCH_LOG_MAX", 5 * 1024 * 1024))
+ALERT_LOG_MAX = _env_num("VNC_WATCH_LOG_MAX", 5 * 1024 * 1024, int)
 
 REPLACE_ID = {"viewer": 4201, "socket": 4202, "xclients": 4203,
               "cpu": 4204, "xtest": 4205, "autorepeat": 4206, "port": 4207}
 COOLDOWN = {"viewer": 0, "socket": 5, "xclients": 1800, "cpu": 1800,
-            "xtest": 30, "autorepeat": 900, "port": 600}
+            "xtest": 30, "autorepeat": 900, "port": 600,
+            # SSH subsystem (separate kinds, never VNC/RDP tiers)
+            "ssh-session": 0, "ssh-connection": 30, "ssh-command": 0,
+            "ssh-x11vnc": 60, "ssh-daemon": 30, "ssh-history": 0,
+            "ssh-keychange": 60}
 # Kinds whose suppressed repeats are rare enough to keep an audit trail.
-LOG_SUPPRESSED = {"socket", "viewer", "port", "autorepeat", "cpu"}
+LOG_SUPPRESSED = {"socket", "viewer", "port", "autorepeat", "cpu",
+                  "ssh-connection", "ssh-daemon"}
 
 TS = re.compile(r"^(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}) (.*)$")
 GOT = re.compile(r"Got connection from client (\S+)")
@@ -165,6 +203,16 @@ def write_json_atomic(path, obj):
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        # Durability: fsync the directory so the rename survives a crash.
+        # Best-effort; some filesystems reject directory fsync.
+        try:
+            dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
     except OSError:
         try:
             os.unlink(tmp)
@@ -179,6 +227,51 @@ def read_json(path):
             return json.load(fh)
     except (OSError, ValueError):
         return None
+
+
+WATCH_LOCK = os.path.join(STATE_DIR, "watch.lock")
+
+
+def acquire_watch_lock():
+    """Take an exclusive lock for the live watcher.
+
+    Two `vnc-watch watch` processes would double-alert and race on state.json.
+    Returns (fd, None) on success or (None, reason) when another instance holds
+    the lock. Does nothing on platforms without fcntl.flock (non-POSIX).
+    """
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        fd = os.open(WATCH_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        # Full or unwritable volume: degrade to running unlocked rather than
+        # refusing to watch at all. A warning is enough here.
+        sys.stderr.write(f"vnc-watch: cannot open {WATCH_LOCK}: {exc}; "
+                         f"running without the single-instance lock\n")
+        return None, None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            os.close(fd)
+            return None, "another vnc-watch watch is already running"
+        # Filesystem without working locks: keep watching, just unlocked.
+        sys.stderr.write(f"vnc-watch: flock unavailable ({exc}); "
+                         f"running without the single-instance lock\n")
+        return fd, None
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass
+    return fd, None
+
+
+def safe_size(path, default=0):
+    """os.path.getsize that never raises (file may vanish between checks)."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return default
 
 
 # ------------------------------------------------------------------- alerts
@@ -511,7 +604,15 @@ def alert(kind, msg, urgent=True, key=None):
 
 # ----------------------------------------------------------------- log tail
 class Tail:
-    """Poll-based tailer that survives rotation and truncation."""
+    """Poll-based tailer that survives rotation, truncation and permission loss.
+
+    Every filesystem call is guarded: a log that disappears, is replaced by a
+    directory, or becomes unreadable mid-run must never take the watcher down.
+    A partial line without a newline is bounded, so a hostile or corrupt file
+    cannot grow memory without limit.
+    """
+
+    MAX_PARTIAL = 1 << 20                  # 1 MiB of a single unterminated line
 
     def __init__(self, path, from_end=True):
         self.path = path
@@ -521,30 +622,60 @@ class Tail:
         self._open(from_end)
 
     def _open(self, from_end):
-        self.fh = open(self.path, "rb")
-        st = os.fstat(self.fh.fileno())
+        fh = open(self.path, "rb")
+        try:
+            st = os.fstat(fh.fileno())
+        except OSError:
+            fh.close()
+            raise
+        self.fh = fh
         self.key = (st.st_dev, st.st_ino)
         if from_end:
-            self.fh.seek(0, os.SEEK_END)
+            fh.seek(0, os.SEEK_END)
         self.buf = b""
+
+    def _reopen(self, from_end):
+        """Reopen after a rotation; returns False instead of raising."""
+        try:
+            self._open(from_end)
+            return True
+        except OSError:
+            self.fh = None
+            self.key = None
+            return False
 
     def readlines(self):
         try:
             st = os.stat(self.path)
         except OSError:
+            if self.fh is None:
+                self._reopen(True)
             return []                      # briefly missing mid-rotation
         if self.fh is None:
-            self._open(True)
+            self._reopen(True)
             return []
         if (st.st_dev, st.st_ino) != self.key:
-            old = self._read()             # finish the old inode first
-            self.fh.close()
-            self._open(False)              # new file from the beginning
+            try:
+                old = self._read()         # finish the old inode first
+            except OSError:
+                old = []
+            try:
+                self.fh.close()
+            except OSError:
+                pass
+            self.fh = None
+            if not self._reopen(False):    # new file from the beginning
+                return old
             return old + self._read()
-        if st.st_size < self.fh.tell():    # truncated in place
-            self.fh.seek(0)
-            self.buf = b""
-        return self._read()
+        try:
+            if st.st_size < self.fh.tell():    # truncated in place
+                self.fh.seek(0)
+                self.buf = b""
+            return self._read()
+        except OSError:
+            self.fh = None
+            self.key = None
+            return []
 
     def _read(self):
         data = self.fh.read()
@@ -552,11 +683,18 @@ class Tail:
             return []
         self.buf += data
         *done, self.buf = self.buf.split(b"\n")   # keep the partial tail
+        if len(self.buf) > self.MAX_PARTIAL:
+            # One enormous unterminated line: keep the tail so memory stays
+            # bounded instead of buffering the whole file.
+            self.buf = self.buf[-self.MAX_PARTIAL:]
         return [line.decode("utf-8", "replace") for line in done]
 
     def close(self):
         if self.fh:
-            self.fh.close()
+            try:
+                self.fh.close()
+            except OSError:
+                pass
             self.fh = None
 
 
@@ -630,33 +768,36 @@ def tier(c):
 def audit():
     ensure_state_dir()
     try:
-        with open(LOG, errors="replace") as fh:
-            lines = fh.readlines()
+        fh = open(LOG, errors="replace")
     except OSError as exc:
         print(f"cannot read {LOG}: {exc}")
         return 1
 
+    # Stream the file: a large or growing log must not be loaded into memory
+    # whole, especially on a nearly full home volume.
     conns, uncorrelated = [], []
-    for line in lines:
-        ev = parse_line(line)
-        if not ev:
-            continue
-        stamp, kind, payload = ev
-        if kind == "got":
-            conns.append(new_conn(payload, stamp))
-        elif kind == "gone":
-            c = close_conn(conns, payload)
-            if c:
-                c["end"] = stamp
-        elif kind in ("strong", "medium", "normal", "ws"):
-            c, _ = open_target(conns)
-            if c is None:
-                uncorrelated.append((stamp, kind, payload))
-            else:
-                c[kind] = True
+    with fh:
+        for line in fh:
+            ev = parse_line(line)
+            if not ev:
+                continue
+            stamp, kind, payload = ev
+            if kind == "got":
+                conns.append(new_conn(payload, stamp))
+            elif kind == "gone":
+                c = close_conn(conns, payload)
+                if c:
+                    c["end"] = stamp
+            elif kind in ("strong", "medium", "normal", "ws"):
+                c, _ = open_target(conns)
+                if c is None:
+                    uncorrelated.append((stamp, kind, payload))
+                else:
+                    c[kind] = True
 
     if not conns:
         print("No connections recorded in the current x11vnc log.")
+        ssh_audit_section()
         return 0
 
     fmt = "%d/%m/%Y %H:%M:%S"
@@ -689,6 +830,7 @@ def audit():
               f"no connection was promoted:")
         for stamp, kind, payload in uncorrelated:
             print(f"  {stamp}  {kind}: {payload[:70]}")
+    ssh_audit_section()
     return 0
 
 
@@ -1226,6 +1368,46 @@ def vnc_servers():
             for pid, comm in sorted(comms.items())]
 
 
+def _load_seat_state():
+    """Parse the seat-state JSON named by VNC_WATCH_LOCK_FILE.
+
+    Returns (doc, reason). `doc` is the parsed JSON object, or None when the
+    state cannot be used: no path configured, file missing or unreadable,
+    malformed JSON, or not a JSON object. `reason` explains the None case.
+
+    This is the single parser for the seat-state file, shared by the detection
+    guard (`active_lock_window`) and the lock-action verifier (`_locked_now`),
+    so both read the same file the same way.
+    """
+    if not POLICY_FILE:
+        return None, "VNC_WATCH_LOCK_FILE is not configured"
+    try:
+        with open(POLICY_FILE) as fh:
+            doc = json.load(fh)
+    except OSError as exc:
+        return None, f"seat state unreadable ({type(exc).__name__})"
+    except ValueError:
+        return None, "seat state malformed (invalid JSON)"
+    if not isinstance(doc, dict):
+        return None, "seat state malformed (not a JSON object)"
+    return doc, ""
+
+
+def _locked_now():
+    """Authoritative lock state for verifying a lock action, as (state, detail).
+
+    Reads only the `locked` field, deliberately ignoring `intervals` (those
+    describe scheduled lock windows, not whether a lock request took effect).
+    `state` is True for the literal JSON true, False for an explicit false or a
+    missing field, and None when the state file cannot be read — so "unlocked"
+    is never confused with "cannot verify".
+    """
+    doc, why = _load_seat_state()
+    if doc is None:
+        return None, why
+    return doc.get("locked") is True, f"locked={doc.get('locked')!r}"
+
+
 def active_lock_window():
     """(True, reason) if a seat controller reports an active lock.
 
@@ -1234,12 +1416,8 @@ def active_lock_window():
     whoever is logged in at :0. With no path configured, an unreadable file or
     malformed content, the state is "unknown" and treated as not active.
     """
-    if not POLICY_FILE:
-        return False, "lock state unavailable"
-    try:
-        with open(POLICY_FILE) as fh:
-            doc = json.load(fh)
-    except (OSError, ValueError):
+    doc, _why = _load_seat_state()
+    if doc is None:
         return False, "lock state unavailable"
     if doc.get("locked") is True:
         return True, f"seat locked by {doc.get('username') or doc.get('session')}"
@@ -1389,7 +1567,8 @@ CHROMIUM_WIPE_ITEMS = [
     "Web Data", "Login Data", "Login Data For Account", "Affiliation Database",
     # cookies and sessions
     "Cookies", "Network/Cookies",
-    "Sessions", "Session Storage", "Local Storage", "IndexedDB",
+    "Sessions", "Current Session", "Current Tabs", "Last Session", "Last Tabs",
+    "Session Storage", "Local Storage", "IndexedDB",
     # caches
     "Cache", "Code Cache", "GPUCache", "Service Worker",
     "Shared Dictionary", "WebStorage", "Storage",
@@ -1456,8 +1635,10 @@ def _remove_path_with_sidecars(path, apply):
     in the -wal, so a whole-file database removal always takes the sidecars
     too. The sidecars never exist without the main file, but a stale one is
     still collected."""
-    freed = _remove_path(path, apply)
+    # Check the type before removal: after it succeeds the path is gone and
+    # isdir() would be False, making a directory look like a file.
     was_dir = os.path.isdir(path) and not os.path.islink(path)
+    freed = _remove_path(path, apply)
     if not was_dir:
         for suffix in SQLITE_SIDECARS:
             freed += _remove_path(path + suffix, apply)
@@ -1626,9 +1807,9 @@ def wipe_targets():
     return targets
 
 
-def wipe_private_data(apply=True, allow_running=False):
-    """Delete browser history/cookies/sessions/caches/credentials and Discord
-    storage.
+def wipe_private_data(apply=True, allow_running=False, encrypt=False,
+                      passphrase=None):
+    """Delete (or encrypt) browser and Discord private data.
 
     Refuses to clean a category whose application is still running (unless
     `allow_running`), and refuses any individual path a same-user process holds
@@ -1636,13 +1817,22 @@ def wipe_private_data(apply=True, allow_running=False):
     family databases are deleted whole with their WAL/SHM sidecars; Firefox
     places.sqlite is cleaned in place with bookmarks preserved.
 
+    With `encrypt=True` the eligible paths are first written to one encrypted,
+    restorable archive (`vault_store`) and verified; only then are the
+    originals removed. If the archive cannot be created or verified, nothing is
+    deleted. No passphrase is ever stored.
+
     Returns {'items': [(label, path, bytes)], 'total': int, 'errors': [...],
-             'skipped': [...]}.
+             'skipped': [...], 'vault': path|None, 'removed': [path, ...],
+             'remaining': [path, ...]}. `removed`/`remaining` name exactly which
+             originals were and were not deleted — there is no atomic rollback.
     """
-    res = {"items": [], "total": 0, "errors": [], "skipped": []}
+    res = {"items": [], "total": 0, "errors": [], "skipped": [], "vault": None,
+           "removed": [], "remaining": []}
     browsers = running_browsers()
     discord = running_discord()
     discord_roots = [os.path.expanduser(r) for r in DISCORD_ROOTS]
+    eligible = []
     for label, path, kind in wipe_targets():
         is_discord = label.startswith("discord/") or any(
             path.startswith(r + os.sep) or path == r for r in discord_roots)
@@ -1650,17 +1840,23 @@ def wipe_private_data(apply=True, allow_running=False):
             if browsers and not is_discord:
                 res["skipped"].append(
                     f"{path}: a browser is running (not stopped)")
+                res["remaining"].append(path)
                 continue
             if discord and is_discord:
                 res["skipped"].append(
                     f"{path}: Discord is running (not stopped)")
+                res["remaining"].append(path)
                 continue
         if apply:
             holder = _file_in_use(path)
             if holder is not None:
                 res["skipped"].append(
                     f"{path}: in use by pid {holder} (not stopped)")
+                res["remaining"].append(path)
                 continue
+        if apply and encrypt:
+            eligible.append((label, path, kind))
+            continue
         try:
             if kind == "places":
                 n = _clean_firefox_places(path, apply)
@@ -1668,20 +1864,632 @@ def wipe_private_data(apply=True, allow_running=False):
                 n = _remove_path_with_sidecars(path, apply)
         except (OSError, RuntimeError) as exc:
             res["errors"].append(f"{path}: {exc}")
+            if apply and os.path.lexists(path):
+                res["remaining"].append(path)
             continue
         res["items"].append((label, path, n))
         res["total"] += n
+        if apply:
+            res["removed"].append(path)
+
+    if apply and encrypt and eligible:
+        try:
+            res["vault"] = vault_store([p for _l, p, _k in eligible], passphrase)
+        except (OSError, RuntimeError) as exc:
+            # Fail closed: the archive did not verify, so keep every original.
+            res["errors"].append(f"vault: {exc} (nothing deleted)")
+            for _label, path, _kind in eligible:
+                res["remaining"].append(path)
+            eligible = []
+        for label, path, _kind in eligible:
+            size = _size_of(path)
+            try:
+                _remove_path_with_sidecars(path, True)
+            except (OSError, RuntimeError) as exc:
+                res["errors"].append(f"{path}: {exc}")
+                res["remaining"].append(path)
+                continue
+            res["items"].append((label, path, size))
+            res["total"] += size
+            res["removed"].append(path)
+
     if apply:
-        log_alert(f"wipe: removed {len(res['items'])} item(s), "
+        verb = "archived" if encrypt else "removed"
+        log_alert(f"wipe: {verb} {len(res['items'])} item(s), "
                   f"{res['total'] / 1048576:.1f} MB, "
                   f"{len(res['errors'])} error(s), "
-                  f"{len(res['skipped'])} skipped")
+                  f"{len(res['skipped'])} skipped, "
+                  f"{len(res['remaining'])} left in place")
+        if res["vault"]:
+            log_alert(f"vault: {res['vault']} (encrypted, restorable)")
         for label, path, n in res["items"]:
             log_alert(f"wipe: {label} {path} ({n / 1048576:.1f} MB)")
         for s in res["skipped"]:
             log_alert(f"wipe skipped: {s}")
+        for s in res["remaining"]:
+            log_alert(f"wipe: still present {s}")
     return res
 
+
+# ------------------------------------------------------------------- vault
+# "Encrypt instead of delete": the same targets are written to one encrypted,
+# restorable tar under the state dir. The originals are removed only after the
+# archive has been MAC-verified, decrypted, and every member re-hashed against
+# a per-file SHA-256 manifest recorded at archive time. A passphrase is read
+# from VNC_WATCH_VAULT_PASSPHRASE or prompted for; it is never persisted.
+#
+# On-disk envelope (authenticated, encrypt-then-MAC). The ciphertext is written
+# first, then authenticated; the MAC is verified *before* any decryption, so a
+# modified, truncated, corrupted or wrong-passphrase archive never reaches the
+# cipher:
+#
+#     "VWVAULT1"      8 bytes    magic
+#     salt           16 bytes    random, per archive
+#     HMAC-SHA256    32 bytes    over magic || salt || ciphertext
+#     ciphertext      ...        backend AES-256 of the tar stream
+#
+# The HMAC key is PBKDF2-HMAC-SHA256(passphrase, salt, 200000). The openssl
+# CBC path carries no authentication of its own, so this envelope is what makes
+# it authenticated; the gpg path is authenticated by this MAC as well.
+VAULT_DIR = os.path.join(STATE_DIR, "vault")
+VAULT_SUFFIXES = (".tar.gpg", ".tar.enc")
+VAULT_MAGIC = b"VWVAULT1"
+VAULT_KDF_ITER = 200000
+VAULT_SALT_LEN = 16
+VAULT_MAC_LEN = 32
+VAULT_HEADER_LEN = len(VAULT_MAGIC) + VAULT_SALT_LEN + VAULT_MAC_LEN
+VAULT_MANIFEST = ".vnc-watch-manifest.json"
+_CHUNK = 1 << 20
+
+
+def _crypto_backend(force=None):
+    """'gpg', 'openssl', or None. gpg is preferred (AES256, battle-tested).
+
+    `force` pins one backend (used by tests to exercise each path independently).
+    """
+    if force in ("gpg", "openssl"):
+        return force if shutil.which(force) else None
+    if shutil.which("gpg"):
+        return "gpg"
+    if shutil.which("openssl"):
+        return "openssl"
+    return None
+
+
+def _pass_fd(passphrase):
+    """A pipe holding the passphrase, to keep it out of argv/`ps`."""
+    r, w = os.pipe()
+    os.write(w, (passphrase + "\n").encode())
+    os.close(w)
+    return r
+
+
+def _cipher_argv(backend, fd, encrypt, src, dst):
+    if backend == "gpg":
+        base = ["gpg", "--batch", "--yes", "--quiet", "--no-tty",
+                "--no-symkey-cache", "--pinentry-mode", "loopback",
+                "--passphrase-fd", str(fd)]
+        if encrypt:
+            return base + ["--symmetric", "--cipher-algo", "AES256",
+                           "--output", dst, src]
+        return base + ["--output", dst, "--decrypt", src]
+    base = ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-md", "sha256",
+            "-salt", "-pass", f"fd:{fd}", "-in", src, "-out", dst]
+    if encrypt:
+        return base
+    return base + ["-d"]
+
+
+def _cipher_apply(backend, passphrase, src, dst, encrypt):
+    """Encrypt or decrypt file `src` to `dst`; raise on a nonzero exit."""
+    fd = _pass_fd(passphrase)
+    try:
+        proc = subprocess.Popen(
+            _cipher_argv(backend, fd, encrypt, src, dst),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, pass_fds=(fd,))
+        err = proc.stderr.read().decode("utf-8", "replace")
+        rc = proc.wait()
+    finally:
+        os.close(fd)
+    if rc != 0:
+        verb = "encrypt" if encrypt else "decrypt"
+        raise RuntimeError(f"{verb} failed (rc={rc}): {err.strip()[:200]}")
+
+
+def _derive_mac_key(passphrase, salt):
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt,
+                               VAULT_KDF_ITER, dklen=VAULT_MAC_LEN)
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_dir(path):
+    try:
+        dfd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def _vault_seal(backend, passphrase, plain_path, out_path):
+    """Encrypt `plain_path` and write the authenticated envelope to out_path."""
+    ct_path = os.path.join(os.path.dirname(out_path), ".vwct-" +
+                           os.path.basename(out_path))
+    try:
+        _cipher_apply(backend, passphrase, plain_path, ct_path, True)
+        salt = os.urandom(VAULT_SALT_LEN)
+        key = _derive_mac_key(passphrase, salt)
+        mac = hmac.new(key, digestmod="sha256")
+        mac.update(VAULT_MAGIC + salt)
+        with open(ct_path, "rb") as cf, os.fdopen(
+                os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                        0o600), "wb") as of:
+            of.write(VAULT_MAGIC + salt + b"\x00" * VAULT_MAC_LEN)
+            while True:
+                chunk = cf.read(_CHUNK)
+                if not chunk:
+                    break
+                mac.update(chunk)
+                of.write(chunk)
+            of.seek(len(VAULT_MAGIC) + VAULT_SALT_LEN)
+            of.write(mac.digest())
+        _fsync_dir(os.path.dirname(out_path))
+    finally:
+        _unlink(ct_path)
+
+
+def _vault_open(backend, passphrase, archive, workdir):
+    """Verify the envelope MAC, then decrypt.
+
+    Returns the decrypted plaintext path under `workdir`. Raises RuntimeError
+    on a bad magic/short header or a MAC mismatch *before* invoking the cipher,
+    so a modified, truncated, corrupted or wrong-passphrase archive is never
+    decrypted.
+    """
+    ct_path = os.path.join(workdir, "body.ct")
+    with open(archive, "rb") as f:
+        header = f.read(VAULT_HEADER_LEN)
+        if (len(header) < VAULT_HEADER_LEN
+                or header[:len(VAULT_MAGIC)] != VAULT_MAGIC):
+            raise RuntimeError("not a vault archive (bad magic or truncated)")
+        salt = header[len(VAULT_MAGIC):len(VAULT_MAGIC) + VAULT_SALT_LEN]
+        want = header[len(VAULT_MAGIC) + VAULT_SALT_LEN:VAULT_HEADER_LEN]
+        key = _derive_mac_key(passphrase, salt)
+        mac = hmac.new(key, digestmod="sha256")
+        mac.update(VAULT_MAGIC + salt)
+        with open(ct_path, "wb") as cf:
+            while True:
+                chunk = f.read(_CHUNK)
+                if not chunk:
+                    break
+                mac.update(chunk)
+                cf.write(chunk)
+    if not hmac.compare_digest(mac.digest(), want):
+        _unlink(ct_path)
+        raise RuntimeError(
+            "authentication failed: wrong passphrase, or the archive was "
+            "modified, corrupted or truncated")
+    plain = os.path.join(workdir, "plain.tar")
+    _cipher_apply(backend, passphrase, ct_path, plain, False)
+    _unlink(ct_path)
+    return plain
+
+
+def _hash_file(path):
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(_CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+def _collect_entries(paths):
+    """Walk `paths`; return (entries, skipped).
+
+    `entries` is a depth-first list of dicts {rel, path, type, sha256, size,
+    mode}. Every regular file gets a SHA-256 taken here. Symlinks, devices,
+    sockets and fifos are recorded in `skipped` and never archived (a symlink
+    cannot be hashed, and restoring one could point outside home).
+    """
+    home = os.path.realpath(os.path.expanduser("~"))
+    entries = []
+    skipped = []
+    seen = set()
+
+    def add(path, rel):
+        if rel in seen:
+            skipped.append(f"{rel}: duplicate path")
+            return
+        if os.path.islink(path):
+            skipped.append(f"{rel}: symlink (not archived)")
+            return
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode):
+            digest, size = _hash_file(path)
+            entries.append({"rel": rel, "path": path, "type": "file",
+                            "sha256": digest, "size": size,
+                            "mode": stat.S_IMODE(st.st_mode)})
+            seen.add(rel)
+        elif stat.S_ISDIR(st.st_mode):
+            entries.append({"rel": rel, "path": path, "type": "dir",
+                            "sha256": None, "size": 0,
+                            "mode": stat.S_IMODE(st.st_mode)})
+            seen.add(rel)
+            for name in sorted(os.listdir(path)):
+                add(os.path.join(path, name), os.path.join(rel, name))
+        else:
+            skipped.append(f"{rel}: special file (not archived)")
+
+    for path in paths:
+        if not os.path.lexists(path):
+            continue
+        add(path, os.path.relpath(os.path.realpath(path), home))
+    return entries, skipped
+
+
+def _write_plain_tar(plain_path, entries):
+    """Write the tar with the manifest first, then each member."""
+    with tarfile.open(plain_path, "w") as tar:
+        manifest = {"version": 1, "entries":
+                    [{k: e[k] for k in ("rel", "type", "sha256", "size",
+                                        "mode")} for e in entries]}
+        data = json.dumps(manifest, sort_keys=True).encode("utf-8")
+        info = tarfile.TarInfo(VAULT_MANIFEST)
+        info.size = len(data)
+        info.mode = 0o600
+        info.mtime = int(time.time())
+        tar.addfile(info, io.BytesIO(data))
+        for entry in entries:
+            tar.add(entry["path"], arcname=entry["rel"], recursive=False)
+
+
+def _parse_manifest(tar):
+    try:
+        fh = tar.extractfile(VAULT_MANIFEST)
+    except KeyError:
+        raise RuntimeError("archive has no manifest")
+    if fh is None:
+        raise RuntimeError("archive manifest is not a regular file")
+    try:
+        return json.loads(fh.read().decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"archive manifest is unreadable: {exc}")
+
+
+def _vault_verify_plain(plain_path):
+    """Re-hash every archived member and compare it with the manifest.
+
+    Raises if a regular member's SHA-256 or size differs (the source changed
+    while archiving, or the archive was modified), if a declared member is
+    missing, if the archive carries an unexpected member, or if any member is a
+    link or special file.
+    """
+    declared = {}
+    found = set()
+    with tarfile.open(plain_path, "r") as tar:
+        manifest = _parse_manifest(tar)
+        for entry in manifest.get("entries", []):
+            declared[entry["rel"]] = entry
+        for member in tar.getmembers():
+            if member.name == VAULT_MANIFEST:
+                continue
+            _safe_member_name(member.name)
+            if member.issym() or member.islnk():
+                raise RuntimeError(f"archive contains a link: {member.name}")
+            if not (member.isreg() or member.isdir()):
+                raise RuntimeError(
+                    f"archive contains a special file: {member.name}")
+            entry = declared.get(member.name)
+            if entry is None:
+                raise RuntimeError(f"unexpected archive member: {member.name}")
+            if entry["type"] == "dir":
+                if not member.isdir():
+                    raise RuntimeError(f"expected a directory: {member.name}")
+                found.add(member.name)
+                continue
+            if not member.isreg():
+                raise RuntimeError(
+                    f"expected a regular file: {member.name}")
+            fh = tar.extractfile(member)
+            h = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = fh.read(_CHUNK)
+                if not chunk:
+                    break
+                h.update(chunk)
+                size += len(chunk)
+            if size != entry["size"] or h.hexdigest() != entry["sha256"]:
+                raise RuntimeError(
+                    f"content hash mismatch for {member.name}: the source "
+                    f"changed while archiving, or the archive was modified")
+            found.add(member.name)
+    missing = set(declared) - found
+    if missing:
+        raise RuntimeError(
+            f"manifest lists {len(missing)} member(s) not in the archive")
+
+
+def vault_passphrase(prompt=None):
+    """Env passphrase, else an interactive prompt. None when unavailable."""
+    pw = os.environ.get("VNC_WATCH_VAULT_PASSPHRASE", "")
+    if pw:
+        return pw
+    if prompt is None:
+        prompt = sys.stdin.isatty()
+    if not prompt:
+        return None
+    import getpass
+    try:
+        return getpass.getpass("Vault passphrase (not stored): ") or None
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def vault_archives():
+    """[(path, size, mtime)] oldest first."""
+    try:
+        names = os.listdir(VAULT_DIR)
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if not name.endswith(VAULT_SUFFIXES):
+            continue
+        path = os.path.join(VAULT_DIR, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        out.append((path, st.st_size, st.st_mtime))
+    return sorted(out, key=lambda item: item[2])
+
+
+def _vault_list_names(archive, passphrase, backend=None):
+    """MAC-verify then decrypt the archive and return its member names."""
+    backend = _crypto_backend(backend)
+    if backend is None:
+        raise RuntimeError("neither gpg nor openssl is installed")
+    try:
+        os.makedirs(VAULT_DIR, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    work = tempfile.mkdtemp(prefix=".vault-", dir=VAULT_DIR)
+    try:
+        plain = _vault_open(backend, passphrase, archive, work)
+        with tarfile.open(plain, "r") as tar:
+            return [m.name for m in tar.getmembers()]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def vault_store(paths, passphrase, backend=None):
+    """Encrypt `paths` into one verified archive; return the archive path.
+
+    The archive is written, decrypted once, and every member re-hashed against
+    the manifest. Raises RuntimeError on any failure, in which case the archive
+    is removed and the caller must keep every original (fail closed).
+    """
+    paths = [p for p in paths if os.path.lexists(p)]
+    if not paths:
+        raise RuntimeError("nothing to archive")
+    backend = _crypto_backend(backend)
+    if backend is None:
+        raise RuntimeError("neither gpg nor openssl is installed")
+    if not passphrase:
+        raise RuntimeError("a vault passphrase is required")
+    try:
+        os.makedirs(VAULT_DIR, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(VAULT_DIR, 0o700)
+        except OSError:
+            pass
+    except OSError as exc:
+        raise RuntimeError(f"cannot create {VAULT_DIR}: {exc}")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    out = os.path.join(VAULT_DIR, f"vnc-watch-{stamp}"
+                       + (".tar.gpg" if backend == "gpg" else ".tar.enc"))
+    work = tempfile.mkdtemp(prefix=".vault-", dir=VAULT_DIR)
+    try:
+        entries, skipped = _collect_entries(paths)
+        for s in skipped:
+            log_alert(f"vault: skipped {s}")
+        if not entries:
+            raise RuntimeError("nothing to archive")
+        plain = os.path.join(work, "plain.tar")
+        _write_plain_tar(plain, entries)
+        _vault_seal(backend, passphrase, plain, out)
+        plain2 = _vault_open(backend, passphrase, out, work)
+        _vault_verify_plain(plain2)
+        _unlink(plain2)
+        return out
+    except BaseException:
+        _unlink(out)
+        raise
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _safe_member_name(name):
+    """Normalize an archive member path; reject escapes and absolute paths."""
+    if name.startswith(("/", os.sep)) or re.match(r"^[A-Za-z]:", name):
+        raise RuntimeError(f"absolute archive member: {name}")
+    norm = os.path.normpath(name)
+    if norm in (".", "") or norm.startswith(".." + os.sep) or norm == ".." \
+            or os.path.isabs(norm):
+        raise RuntimeError(f"unsafe archive member: {name}")
+    return norm
+
+
+def _first_symlink_parent(path, home):
+    """Return the first symlinked path component under `home`, or None."""
+    rel = os.path.relpath(path, home)
+    if rel in (".", ""):
+        return None
+    cur = home
+    for part in rel.split(os.sep):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return cur
+    return None
+
+
+def _extract_staging(tar, staging):
+    """Extract archive members into `staging`, rejecting unsafe entries."""
+    seen = set()
+    for member in tar.getmembers():
+        if member.name == VAULT_MANIFEST:
+            continue
+        rel = _safe_member_name(member.name)
+        if rel in seen:
+            raise RuntimeError(f"duplicate archive member: {member.name}")
+        seen.add(rel)
+        dest = os.path.join(staging, rel)
+        if member.isdir():
+            os.makedirs(dest, exist_ok=True)
+            continue
+        if member.issym() or member.islnk():
+            raise RuntimeError(f"refusing link member: {member.name}")
+        if not member.isreg():
+            raise RuntimeError(f"refusing special member: {member.name}")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        src = tar.extractfile(member)
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(src, out, _CHUNK)
+        try:
+            os.chmod(dest, member.mode & 0o777)
+        except OSError:
+            pass
+
+
+def _merge_staging(staging, home, entries, restored, conflicts):
+    """Move staged members into home without clobbering anything."""
+    for entry in sorted(entries, key=lambda e: e["rel"].count(os.sep)):
+        rel = entry["rel"]
+        dest = os.path.join(home, rel)
+        bad = _first_symlink_parent(os.path.dirname(dest), home)
+        if bad is not None:
+            conflicts.append((rel, f"destination parent is a symlink: {bad}"))
+            continue
+        if entry["type"] == "dir":
+            if os.path.lexists(dest) and not os.path.isdir(dest):
+                conflicts.append((rel, "a non-directory already exists"))
+                continue
+            try:
+                os.makedirs(dest, exist_ok=True)
+            except OSError as exc:
+                conflicts.append((rel, str(exc)))
+            continue
+        src = os.path.join(staging, rel)
+        if os.path.lexists(dest):
+            conflicts.append((rel, "already exists (left untouched)"))
+            continue
+        try:
+            os.link(src, dest)                       # no-clobber
+        except FileExistsError:
+            conflicts.append((rel, "already exists (left untouched)"))
+            continue
+        except OSError:
+            try:
+                fd = os.open(dest,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                             entry["mode"] & 0o777)
+            except FileExistsError:
+                conflicts.append((rel, "already exists (left untouched)"))
+                continue
+            with os.fdopen(fd, "wb") as out, open(src, "rb") as f:
+                shutil.copyfileobj(f, out, _CHUNK)
+        restored.append(rel)
+
+
+def vault_verify(archive="latest", passphrase=None, backend=None):
+    """Verify an archive's MAC and every member hash without restoring it."""
+    archives = vault_archives()
+    if archive in (None, "", "latest"):
+        if not archives:
+            raise RuntimeError("no vault archive found")
+        archive = archives[-1][0]
+    if not os.path.isfile(archive):
+        raise RuntimeError(f"archive not found: {archive}")
+    pw = passphrase or vault_passphrase()
+    if not pw:
+        raise RuntimeError("a vault passphrase is required")
+    backend = _crypto_backend(backend)
+    if backend is None:
+        raise RuntimeError("neither gpg nor openssl is installed")
+    try:
+        os.makedirs(VAULT_DIR, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    work = tempfile.mkdtemp(prefix=".vault-", dir=VAULT_DIR)
+    try:
+        plain = _vault_open(backend, pw, archive, work)
+        _vault_verify_plain(plain)
+        with tarfile.open(plain, "r") as tar:
+            members = [m.name for m in tar.getmembers()
+                       if m.name != VAULT_MANIFEST]
+        return {"archive": archive, "members": members}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def vault_restore(archive="latest", passphrase=None, backend=None):
+    """Verify, then restore an archive into home without clobbering.
+
+    Returns {'restored': [rel, ...], 'conflicts': [(rel, reason), ...]}. The
+    archive is MAC-checked and every member re-hashed before anything is
+    extracted; extraction goes to a staging directory and members are moved
+    into place with no-clobber (existing files are never overwritten).
+    """
+    archives = vault_archives()
+    if archive in (None, "", "latest"):
+        if not archives:
+            raise RuntimeError("no vault archive found")
+        archive = archives[-1][0]
+    if not os.path.isfile(archive):
+        raise RuntimeError(f"archive not found: {archive}")
+    pw = passphrase or vault_passphrase()
+    if not pw:
+        raise RuntimeError("a vault passphrase is required")
+    backend = _crypto_backend(backend)
+    if backend is None:
+        raise RuntimeError("neither gpg nor openssl is installed")
+    try:
+        os.makedirs(VAULT_DIR, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    home = os.path.realpath(os.path.expanduser("~"))
+    work = tempfile.mkdtemp(prefix=".vault-", dir=VAULT_DIR)
+    staging = tempfile.mkdtemp(prefix=".restore-", dir=home)
+    restored = []
+    conflicts = []
+    try:
+        plain = _vault_open(backend, pw, archive, work)
+        _vault_verify_plain(plain)
+        with tarfile.open(plain, "r") as tar:
+            entries = _parse_manifest(tar).get("entries", [])
+            _extract_staging(tar, staging)
+        _merge_staging(staging, home, entries, restored, conflicts)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
+    log_alert(f"vault restore: {len(restored)} restored, "
+              f"{len(conflicts)} conflict(s) from {archive}")
+    return {"restored": restored, "conflicts": conflicts}
 
 
 # ------------------------------------------------------------ hotkey setup
@@ -1810,7 +2618,7 @@ def close_remote_view():
 # ----------------------------------------------------------- action window
 POPUP_LOCK = os.path.join(STATE_DIR, "popup.lock")
 POPUP_COOLDOWN = 120.0
-POPUP_TIMEOUT = int(os.environ.get("VNC_WATCH_POPUP_TIMEOUT", "60"))
+POPUP_TIMEOUT = _env_num("VNC_WATCH_POPUP_TIMEOUT", 60, int)
 _last_popup = 0.0
 
 
@@ -2139,6 +2947,561 @@ def loginctl_sessions():
     return out
 
 
+# -------------------------------------------------------------- ssh subsystem
+# SSH is its own subsystem: its own event kinds, wording and state. It never
+# feeds VIEWER_TIERS and never changes REMOTE_PORTS. Everything here is
+# unprivileged; auth.log/btmp/journal are optional and only used when readable.
+SSH_PORT = 22
+PROC_ROOT = os.environ.get("VNC_WATCH_PROC", "/proc")
+WTMP_FILE = os.environ.get("VNC_WATCH_WTMP", "/var/log/wtmp")
+UTMP_RECORD_SIZE = _env_num("VNC_WATCH_UTMP_SIZE", 384, int)
+SSH_SEEN_MAX = 2000
+SSH_WEBHOOK_MAX = _env_num("VNC_WATCH_SSH_WEBHOOK_MAX", 20, int)
+SSH_WEBHOOK_COOLDOWN = _env_num("VNC_WATCH_SSH_WEBHOOK_COOLDOWN", 30.0, float)
+# Command capture is OFF by default. When enabled, only a redacted summary is
+# ever stored: secrets masked, script bodies replaced, no /proc/*/environ.
+SSH_CMDLINE = os.environ.get("VNC_WATCH_SSH_CMDLINE", "") == "1"
+# Client-side detection (this host connecting OUT to a remote :22/:5900/...).
+# Separate, gated, local-only signal: never feeds VIEWER_TIERS or REMOTE_PORTS.
+# Disable with VNC_WATCH_SSH_OUTBOUND=0.
+SSH_OUTBOUND = os.environ.get("VNC_WATCH_SSH_OUTBOUND", "1") != "0"
+# Service ports whose *remote* end marks a connection as outbound. Kept distinct
+# from REMOTE_PORTS (which stays inbound-only) so the two never blur.
+OUTBOUND_PORTS = set(REMOTE_PORTS) | {SSH_PORT}
+
+AUTOMATED_EXES = {"scp", "sftp", "rsync", "ansible", "ansible-playbook",
+                  "git-upload-pack", "git-receive-pack", "nc", "ncat", "tar"}
+SECRET_FLAGS = ("password", "passwd", "pass", "token", "secret", "api-key",
+                "apikey", "auth", "private-key", "passphrase", "pin",
+                "client-secret", "access-token", "refresh-token")
+SCRIPT_FLAGS = {"-c", "--command", "--eval"}
+
+_ssh_wh_last = {}
+_ssh_wh_times = collections.deque()
+
+
+def _read(path, binary=False):
+    try:
+        with open(path, "rb" if binary else "r") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def ssh_source_report():
+    """Which SSH sources are readable right now (never requests privilege)."""
+    def ok(p):
+        return os.access(p, os.R_OK)
+    return {
+        "ss": shutil.which("ss") is not None,
+        "loginctl": shutil.which("loginctl") is not None,
+        "utmp": ok(UTMP_FILE),
+        "wtmp": ok(WTMP_FILE),
+        "proc": ok(os.path.join(PROC_ROOT, "1", "stat")),
+        "auth_log": ok("/var/log/auth.log"),
+        "btmp": ok("/var/log/btmp"),
+    }
+
+
+def ssh_established():
+    """[(peer, peer_port, local_port)] for established inbound TCP to :22, or None."""
+    try:
+        out = subprocess.run(["ss", "-H", "-tn", "state", "established"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = []
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) < 4:
+            continue
+        try:
+            lport = int(p[2].rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if lport != SSH_PORT:
+            continue
+        host, rport = norm_addr(p[3])
+        found.append((host, rport, lport))
+    return found
+
+
+def outbound_peers():
+    """Client-side established TCP connections to a remote monitored port.
+
+    Returns [{rport, rhost, lport, lhost}] or None.
+
+    Server-side vs client-side is inferred from ports, not from process or user
+    ownership. A local socket whose own port is a monitored service port is
+    treated as the server side *only when a listener is actually bound to that
+    port* (queried via ss). If no such listener exists, a local socket on a
+    service port is anomalous and is reported rather than silently dropped.
+
+    Residual limitation: if a host both listens on a service port and a process
+    also uses that same port as a *source* port (explicit bind or a port range
+    that includes it), that client-side socket is still masked as server-side.
+    This is a port-match OBSERVED signal only: it never feeds VIEWER_TIERS and
+    never touches REMOTE_PORTS. It carries no process or user attribution.
+    """
+    if not SSH_OUTBOUND:
+        return []
+    try:
+        out = subprocess.run(["ss", "-H", "-tn", "state", "established"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    listen = listening_ports()          # None when unavailable
+    found = []
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) < 4:
+            continue
+        rhost, rport = norm_addr(p[3])
+        lhost, lport = norm_addr(p[2])
+        try:
+            rp, lp = int(rport), int(lport)
+        except (IndexError, ValueError):
+            continue
+        if rp not in OUTBOUND_PORTS:
+            continue
+        # Server side only when the local service port is actually listening.
+        # With listener info unavailable, stay conservative and skip it.
+        if lp in OUTBOUND_PORTS and (listen is None or lp in listen):
+            continue
+        found.append({"rport": rp, "rhost": rhost,
+                      "lport": lp, "lhost": lhost})
+    return found
+
+
+def ssh_listening():
+    """True/False/None for a listener on :22."""
+    ports = listening_ports()
+    if ports is None:
+        return None
+    return SSH_PORT in ports
+
+
+def loginctl_detail(sid):
+    try:
+        r = subprocess.run(["loginctl", "show-session", str(sid),
+                            "-p", "User", "-p", "Remote", "-p", "RemoteHost",
+                            "-p", "Service", "-p", "Leader", "-p", "TTY"],
+                           capture_output=True, text=True, timeout=4)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    d = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition("=")
+        d[k.strip()] = v.strip()
+    return d
+
+
+def ssh_sessions():
+    """Enriched remote sessions, or None when loginctl is unavailable.
+
+    loginctl session id, POSIX process sid and Leader are distinct: the event
+    keeps `loginctl_sid` and `leader_pid`; process correlation uses the session
+    cgroup or the Leader PID, never the loginctl id as a POSIX sid.
+    """
+    base = loginctl_sessions()
+    if base is None:
+        return None
+    utmp = utmp_sessions() or []
+    by_line = {u["line"]: u for u in utmp if u.get("line")}
+    out = []
+    for s in base:
+        d = loginctl_detail(s["sid"]) or {}
+        remote = (d.get("Remote") == "yes" or bool(d.get("RemoteHost"))
+                  or d.get("Service") == "sshd")
+        if not remote:
+            continue
+        tty = d.get("TTY") or ""
+        u = by_line.get(tty)
+        if u is None and d.get("RemoteHost"):
+            u = next((x for x in utmp
+                      if x.get("user") == s["user"]
+                      and x.get("host") == d.get("RemoteHost")), None)
+        leader = d.get("Leader", "")
+        out.append({
+            "kind": "ssh-session",
+            "key": f"sess:{s['sid']}",
+            "loginctl_sid": s["sid"],
+            "account": s["user"],
+            "uid": s["uid"],
+            "leader_pid": int(leader) if leader.isdigit() else None,
+            "service": d.get("Service") or "sshd",
+            "remote_host": d.get("RemoteHost") or (u["host"] if u else ""),
+            "line": tty or (u["line"] if u else ""),
+            "start": u["start"] if u else None,
+            "evidence": "OBSERVED",
+        })
+    return out
+
+
+def _stat_fields(pid):
+    raw = _read(os.path.join(PROC_ROOT, pid, "stat"))
+    if not raw:
+        return None
+    try:
+        r = raw.rsplit(")", 1)[1].split()
+        # f3=state r[0], f4=ppid r[1], f5=pgrp r[2], f6=session r[3],
+        # f22=starttime r[19]
+        return {"ppid": int(r[1]), "process_sid": int(r[3]),
+                "start_ticks": int(r[19])}
+    except (IndexError, ValueError):
+        return None
+
+
+def _session_scope(pid):
+    cg = _read(os.path.join(PROC_ROOT, pid, "cgroup")) or ""
+    m = re.search(r"/session-([0-9A-Za-z]+)\.scope", cg)
+    return m.group(1) if m else None
+
+
+def _exe_name(pid):
+    try:
+        return os.path.basename(os.readlink(os.path.join(PROC_ROOT, pid, "exe")))
+    except OSError:
+        return (_read(os.path.join(PROC_ROOT, pid, "comm")) or "").strip() or "?"
+
+
+def _redact_argv(argv):
+    """Mask likely secrets; mask script bodies. Returns a safe token list."""
+    out, mask_next, script_next = [], False, False
+    for a in argv:
+        if mask_next:
+            out.append("***REDACTED***")
+            mask_next = False
+            continue
+        if script_next:
+            out.append("***SCRIPT***")
+            script_next = False
+            continue
+        if a in SCRIPT_FLAGS:
+            out.append(a)
+            script_next = True
+            continue
+        low = a.lower()
+        if a.startswith("-"):
+            name = low.split("=", 1)[0].lstrip("-")
+            if any(s in name for s in SECRET_FLAGS):
+                if "=" in a:
+                    out.append(a.split("=", 1)[0] + "=***REDACTED***")
+                else:
+                    out.append(a)
+                    mask_next = True
+                continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", a):
+            key = a.split("=", 1)[0].upper()
+            if any(s in key for s in ("PASS", "TOKEN", "SECRET", "KEY", "AUTH")):
+                out.append(a.split("=", 1)[0] + "=***REDACTED***")
+                continue
+        if re.search(r"(?i)bearer\s+\S+", a):
+            out.append(re.sub(r"(?i)(bearer\s+)\S+", r"\1***REDACTED***", a))
+            continue
+        if re.match(r"^(ghp_|gho_|github_pat_|xox[abprs]-|AKIA|ASIA|sk-|eyJ)", a):
+            out.append("***REDACTED***")
+            continue
+        out.append(a[:200])
+    return out
+
+
+def _safe_cmdline(pid):
+    if not SSH_CMDLINE:
+        return None
+    raw = _read(os.path.join(PROC_ROOT, pid, "cmdline"), binary=True)
+    if raw is None:
+        return None
+    parts = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+    return _redact_argv(parts) if parts else None
+
+
+def ssh_processes(loginctl_sid):
+    """Processes whose cgroup is this logind session, or None.
+
+    Identity is loginctl_sid:pid:start_ticks so a repeated poll is stable while
+    a later run of the same executable is still a new event. /proc is a
+    point-in-time snapshot, never a command history.
+    """
+    try:
+        pids = [p for p in os.listdir(PROC_ROOT) if p.isdigit()]
+    except OSError:
+        return None
+    out = []
+    want = str(loginctl_sid)
+    for pid in pids:
+        if _session_scope(pid) != want:
+            continue
+        st = _stat_fields(pid)
+        if not st:
+            continue
+        exe = _exe_name(pid)
+        out.append({
+            "kind": "ssh-command",
+            "key": f"{want}:{pid}:{st['start_ticks']}",
+            "identity": f"{want}:{pid}:{st['start_ticks']}",
+            "loginctl_sid": want,
+            "pid": int(pid),
+            "ppid": st["ppid"],
+            "process_sid": st["process_sid"],
+            "start_ticks": st["start_ticks"],
+            "exe": exe,
+            "automation": "automated" if exe in AUTOMATED_EXES else "unknown",
+            "cmd_redacted": _safe_cmdline(pid),
+            "evidence": "OBSERVED",
+        })
+    return out
+
+
+def wtmp_new_records(state):
+    """(records, newstate, note). Only whole records past the stored offset.
+
+    Validates the configured record size against the file before trusting it;
+    on an unsupported layout it returns note='unsupported' rather than guessing.
+    Never classifies a record as SSH: USER_PROCESS with a remote host is kept
+    as historical, remote-login evidence only.
+    """
+    try:
+        st = os.stat(WTMP_FILE)
+    except OSError:
+        return None, state, "unavailable"
+    size = UTMP_RECORD_SIZE
+    if size <= 0 or st.st_size % size != 0:
+        return None, state, f"unsupported ({st.st_size} % {size})"
+    prev = state or {}
+    note = None
+    offset = prev.get("offset", 0) if prev.get("inode") == st.st_ino else 0
+    if prev and prev.get("inode") not in (None, st.st_ino):
+        note = "rotated"
+    elif offset > st.st_size:
+        note = "truncated"
+        offset = 0
+    try:
+        with open(WTMP_FILE, "rb") as fh:
+            fh.seek(offset)
+            data = fh.read()
+    except OSError:
+        return None, state, "unreadable"
+    whole = len(data) - (len(data) % size)
+    data = data[:whole]
+    out = []
+    for off in range(0, whole, size):
+        ut_type = struct.unpack_from("<h", data, off)[0]
+        if ut_type != UTMP_USER_PROCESS:
+            continue
+        user = _cstr(data[off + 44:off + 76])
+        host = _cstr(data[off + 76:off + 332]) if size >= 332 else ""
+        line = _cstr(data[off + 8:off + 40])
+        if not host or host in (":0", ":1"):
+            continue
+        out.append({"user": user, "host": host, "line": line})
+    newstate = {"inode": st.st_ino, "offset": offset + whole, "size": st.st_size}
+    return out, newstate, note
+
+
+def x11vnc_service_state():
+    try:
+        r = subprocess.run(["systemctl", "show", "x11vnc.service",
+                            "-p", "ActiveState", "-p", "UnitFileState"],
+                           capture_output=True, text=True, timeout=4)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    d = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition("=")
+        if k:
+            d[k] = v
+    return d or None
+
+
+def ssh_key_state():
+    """Size+mtime of this user's authorized_keys files (change detection)."""
+    out = {}
+    for rel in ("~/.ssh/authorized_keys", "~/.ssh/authorized_keys2"):
+        p = os.path.expanduser(rel)
+        try:
+            st = os.stat(p)
+            out[rel] = [st.st_size, int(st.st_mtime)]
+        except OSError:
+            out[rel] = None
+    return out
+
+
+def ssh_severity(ev):
+    k = ev.get("kind")
+    if ev.get("evidence") == "AUTHENTICATED":
+        return "warning"
+    if k == "ssh-session":
+        return "info"
+    if k == "ssh-connection":
+        return "warning"
+    if k == "ssh-command":
+        return "info" if ev.get("automation") == "automated" else "warning"
+    return "info"
+
+
+def _ssh_audit_line(ev):
+    k = ev.get("kind")
+    if k == "ssh-x11vnc":
+        return (f"ssh x11vnc service: {ev.get('from')} -> {ev.get('to')} "
+                f"(service observation; cause unknown)")
+    if k == "ssh-history":
+        return f"ssh history: {ev.get('account')} from {ev.get('host')} ({ev.get('line')})"
+    if k == "outbound":
+        return (f"outbound tcp: {ev.get('lhost')}:{ev.get('lport')} -> "
+                f"{ev.get('rhost')}:{ev.get('rport')} "
+                f"(observed TCP to monitored dest port {ev.get('rport')})")
+    who = f"{ev.get('account') or 'unknown'} from {ev.get('remote_host') or ev.get('peer') or '?'}"
+    extra = ""
+    if k == "ssh-command":
+        extra = f" exe={ev.get('exe')} pid={ev.get('pid')} start={ev.get('start_ticks')}"
+        if ev.get("cmd_redacted"):
+            extra += " cmd=" + " ".join(ev["cmd_redacted"])[:200]
+    return f"{k}: {who}{extra} [evidence {ev.get('evidence')}]"
+
+
+def ssh_remote_message(ev):
+    """Metadata-only payload. Never includes argv, script bodies or env."""
+    k = ev.get("kind")
+    lines = []
+    if k == "ssh-x11vnc":
+        lines += [f"service: {ev.get('service')}",
+                  f"change: {ev.get('from')} -> {ev.get('to')}",
+                  "cause: unknown",
+                  f"evidence: {ev.get('evidence')} (systemctl show)"]
+        title = "vnc-watch: SERVICE STATE OBSERVATION"
+    else:
+        lines += [f"event: {k}",
+                  "account: " + (ev.get("account") or "unknown")
+                  + (f" (uid {ev['uid']})" if ev.get("uid") else ""),
+                  "source: " + (ev.get("remote_host") or ev.get("peer") or "unknown")]
+        if ev.get("loginctl_sid"):
+            lines.append(f"session: loginctl {ev['loginctl_sid']}"
+                         + (f" ({ev.get('line')}, {ev.get('service')})"
+                            if ev.get("line") else ""))
+        else:
+            lines.append("session: none correlated")
+        lines.append(f"evidence: {ev.get('evidence')}")
+        if k == "ssh-command":
+            lines += [f"executable: {ev.get('exe')}",
+                      f"process: pid {ev.get('pid')} ppid {ev.get('ppid')} "
+                      f"start_ticks {ev.get('start_ticks')}",
+                      f"automation: {ev.get('automation')}"]
+        title = "vnc-watch: SSH " + k.split("-", 1)[1].upper()
+    lines.append("note: metadata only; does not identify the operator")
+    lines.append(f"time: {datetime.now():%Y-%m-%d %H:%M:%S %Z}")
+    return title, "\n".join(lines)
+
+
+def _ssh_should_webhook(ev):
+    k = ev.get("kind")
+    if k not in ("ssh-session", "ssh-connection", "ssh-command", "ssh-x11vnc"):
+        return False
+    # Only bocal (or an unattributed connection/service observation) leaves the
+    # machine. Another account's activity stays local unless explicitly allowed.
+    return ev.get("account") in (None, "bocal")
+
+
+def ssh_emit(ev, notify_local=True):
+    """Audit always; local notify + webhook are best-effort and independent."""
+    log_alert(_ssh_audit_line(ev))
+    if notify_local and ev.get("kind") in ("ssh-session", "ssh-connection",
+                                           "ssh-x11vnc", "outbound"):
+        notify("SSH watch", _ssh_audit_line(ev), ev["kind"],
+               ssh_severity(ev) in ("warning", "critical"))
+    if not _ssh_should_webhook(ev):
+        return
+    k = ev.get("kind")
+    if k == "ssh-command":
+        key = f"cmd:{ev.get('account')}:{ev.get('exe')}"
+    elif k == "ssh-session":
+        key = f"sess:{ev.get('loginctl_sid')}"
+    elif k == "ssh-connection":
+        key = f"conn:{ev.get('peer')}:{ev.get('peer_port')}"
+    else:
+        key = f"x11vnc:{ev.get('from')}:{ev.get('to')}"
+    now = time.monotonic()
+    last = _ssh_wh_last.get(key)
+    if last is not None and now - last < SSH_WEBHOOK_COOLDOWN:
+        log_alert(f"ssh webhook cooled down: {key}")
+        return
+    _ssh_wh_last[key] = now
+    while _ssh_wh_times and now - _ssh_wh_times[0] > 60:
+        _ssh_wh_times.popleft()
+    if len(_ssh_wh_times) >= SSH_WEBHOOK_MAX:
+        log_alert(f"ssh webhook rate-limited: dropped {k} ({ev.get('account')})")
+        return
+    _ssh_wh_times.append(now)
+    title, text = ssh_remote_message(ev)
+    if not remote_alert(title, text):
+        log_alert(f"ssh webhook not sent ({k}): no channel configured or queue full")
+
+
+def ssh_scan():
+    """One point-in-time snapshot of the SSH surface (used by watch and audit)."""
+    return {
+        "sessions": ssh_sessions(),
+        "connections": ssh_established(),
+        "outbound": outbound_peers(),
+        "listening": ssh_listening(),
+        "x11vnc": x11vnc_service_state(),
+        "xclients": x_client_count(),
+        "keys": ssh_key_state(),
+        "sources": ssh_source_report(),
+    }
+
+
+def ssh_audit_section():
+    """Human-readable SSH block for `audit` / `ssh` commands."""
+    print("\n== SSH (separate subsystem, unprivileged) ==")
+    src = ssh_source_report()
+    print("  sources: " + ", ".join(
+        f"{k}={'ok' if v else 'no'}" for k, v in sorted(src.items())))
+    sess = ssh_sessions()
+    if sess is None:
+        print("  sessions: unavailable (loginctl)")
+    elif not sess:
+        print("  sessions: none remote")
+    else:
+        for s in sess:
+            print(f"  session {s['loginctl_sid']}: {s['account']} "
+                  f"from {s['remote_host'] or '?'} "
+                  f"({s['service']}, {s['line'] or '-'})")
+            procs = ssh_processes(s["loginctl_sid"]) or []
+            for p in procs:
+                print(f"    proc {p['pid']} {p['exe']} "
+                      f"({p['automation']}, start {p['start_ticks']})")
+    conns = ssh_established()
+    if conns is None:
+        print("  connections: unavailable (ss)")
+    else:
+        for peer, rport, lport in conns:
+            print(f"  tcp :{lport} <- {peer}:{rport} (established)")
+    print("\n  == outbound (client-side; observed TCP to monitored dest ports) ==")
+    outs = outbound_peers()
+    if outs is None:
+        print("  unavailable (ss)")
+    elif not outs:
+        print("  none")
+    else:
+        for o in outs:
+            print(f"  {o['lhost']}:{o['lport']} -> {o['rhost']}:{o['rport']} "
+                  f"(dest port {o['rport']}; observed TCP only)")
+    x = x11vnc_service_state()
+    if x:
+        print(f"  x11vnc.service: {x.get('ActiveState')} "
+              f"(unit {x.get('UnitFileState')})")
+    if not src.get("auth_log"):
+        print("  auth.log: unavailable (needs adm) - login method/key not read")
+    if not src.get("btmp"):
+        print("  btmp: unavailable (needs root/utmp) - failed logins not read")
+    return 0
+
+
 # ------------------------------------------------------------- state file
 def snapshot(conns, sockets, listeners, extra):
     now = time.monotonic()
@@ -2180,6 +3543,11 @@ def follow_live(args):
         log_alert(f"migrated {len(moved)} state file(s) into {STATE_DIR}")
         for old, new in moved:
             print(f"migrated {old} -> {new}", flush=True)
+
+    lock_fd, lock_err = acquire_watch_lock()
+    if lock_err:
+        print(f"not starting: {lock_err}", flush=True)
+        return 2
 
     try:
         tail = Tail(LOG, from_end=True)
@@ -2272,8 +3640,10 @@ def follow_live(args):
     n0 = x_client_count()
     if n0 is not None:
         samples.append(n0)
+    # None means "unknown", not "no listeners": seeding an empty baseline would
+    # make every existing service listener look new the first time ss works.
     ports0 = listening_ports()
-    known_ports = ports0 if ports0 is not None else set()
+    known_ports = ports0
 
     print(f"script mtime     : {datetime.fromtimestamp(os.path.getmtime(__file__)):%Y-%m-%d %H:%M:%S} ({__file__})")
     print(f"state dir        : {STATE_DIR}")
@@ -2306,10 +3676,71 @@ def follow_live(args):
         sid_seen = {s["key"] for s in (loginctl_sessions() or [])}
     except Exception:
         sid_seen = set()
+
+    # --- SSH subsystem: seed from persisted state so a restart never re-alerts
+    prev_state = read_json(STATE_FILE) or {}
+    prev_ssh = prev_state.get("ssh") or {}
+    ssh_seen = set(prev_ssh.get("seen") or [])
+    ssh_sessions_seen = set(prev_ssh.get("sessions_seen") or [])
+    wtmp_state = prev_ssh.get("wtmp") or {}
+    x11vnc_prev = prev_ssh.get("x11vnc")
+    xclient_base = prev_ssh.get("xclients")
+    key_prev = prev_ssh.get("keys") or {}
+    ssh_state = ssh_scan()
+    ssh_sources = ssh_state["sources"]
+    ssh_prev_listen = ssh_state["listening"]
+    log_alert("ssh sources: " + ", ".join(
+        f"{k}={'ok' if v else 'unavailable'}"
+        for k, v in sorted(ssh_sources.items())))
+    if not wtmp_state:
+        try:
+            stt = os.stat(WTMP_FILE)
+            if UTMP_RECORD_SIZE > 0 and stt.st_size % UTMP_RECORD_SIZE == 0:
+                wtmp_state = {"inode": stt.st_ino, "offset": stt.st_size,
+                              "size": stt.st_size}
+                log_alert(f"ssh history: wtmp baseline {stt.st_size} bytes "
+                          f"({stt.st_size // UTMP_RECORD_SIZE} records not "
+                          f"replayed)")
+            else:
+                log_alert("ssh history unavailable: wtmp format unsupported")
+        except OSError as exc:
+            log_alert(f"ssh history unavailable: {exc}")
+    for s in (ssh_state["sessions"] or []):
+        ssh_seen.add(s["key"])
+        if s["loginctl_sid"] in ssh_sessions_seen:
+            continue
+        ssh_sessions_seen.add(s["loginctl_sid"])
+        log_alert(f"ssh pre-existing: {s['account']} from "
+                  f"{s['remote_host'] or '?'} (session {s['loginctl_sid']}, "
+                  f"{s['service']}) - surfaced, not alerted")
+        for p in (ssh_processes(s["loginctl_sid"]) or []):
+            ssh_seen.add(p["identity"])
+    for peer, rport, lport in (ssh_state["connections"] or []):
+        ssh_seen.add(f"conn:{peer}:{rport}:{lport}")
+    for o in (ssh_state["outbound"] or []):
+        ssh_seen.add(f"out:{o['lhost']}:{o['lport']}:{o['rhost']}:{o['rport']}")
+    if ssh_state["sessions"] is None:
+        log_alert("ssh source unavailable: loginctl (session detection off)")
+    if ssh_state["connections"] is None:
+        log_alert("ssh source unavailable: ss (connection detection off)")
+    last_ssh_check = time.monotonic()
     dirty = True
 
     def note(msg):
         recent.append(f"{datetime.now():%H:%M:%S} {msg}")
+
+    # SIGTERM/SIGHUP must still run the cleanup block (close the tail, stop the
+    # xinput child, release the lock). Default signal disposition skips
+    # `finally`, which is why orphaned xinput writers had to be reaped at start.
+    def _graceful(signum, frame):
+        raise KeyboardInterrupt
+
+    saved_signals = {}
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            saved_signals[_sig] = signal.signal(_sig, _graceful)
+        except (OSError, ValueError):
+            pass
 
     try:
         while True:
@@ -2452,8 +3883,13 @@ def follow_live(args):
                 # 4b) new listener on a remote-viewing port
                 ports = listening_ports()
                 if ports is not None:
-                    new = {p for p in ports - known_ports if p in REMOTE_PORTS}
-                    known_ports = ports
+                    if known_ports is None:
+                        known_ports = ports   # first good read: baseline only
+                        new = set()
+                    else:
+                        new = {p for p in ports - known_ports
+                               if p in REMOTE_PORTS}
+                        known_ports = ports
                     for p in new:
                         alert("port", f"new listener on remote-viewing port {p}")
 
@@ -2485,6 +3921,98 @@ def follow_live(args):
                                   urgent=(s["user"] != me),
                                   key=f"login:{s['key']}")
                             note(f"session {s['sid']} {s['user']}")
+
+                # 4b3) SSH subsystem: separate kinds, never VNC/RDP tiers
+                if now - last_ssh_check >= 5:
+                    last_ssh_check = now
+                    snap = ssh_scan()
+                    ssh_state = snap
+                    sess_now = snap["sessions"]
+                    if sess_now is not None:
+                        for s in sess_now:
+                            if s["key"] in ssh_seen:
+                                continue
+                            ssh_seen.add(s["key"])
+                            ssh_emit(dict(s))
+                        for s in sess_now:
+                            for p in (ssh_processes(s["loginctl_sid"]) or []):
+                                if p["identity"] in ssh_seen:
+                                    continue
+                                ssh_seen.add(p["identity"])
+                                ssh_emit(dict(p, account=s["account"],
+                                              uid=s["uid"],
+                                              remote_host=s["remote_host"],
+                                              service=s["service"]),
+                                         notify_local=False)
+                    known_peers = {s["remote_host"] for s in (sess_now or [])
+                                   if s["remote_host"]}
+                    if snap["connections"] is not None:
+                        for peer, rport, lport in snap["connections"]:
+                            key = f"conn:{peer}:{rport}:{lport}"
+                            if key in ssh_seen:
+                                continue
+                            ssh_seen.add(key)
+                            if peer in known_peers:
+                                continue
+                            ssh_emit({"kind": "ssh-connection",
+                                      "evidence": "OBSERVED", "account": None,
+                                      "peer": peer, "peer_port": rport,
+                                      "local_port": lport,
+                                      "remote_host": peer})
+                    if snap["outbound"] is not None:
+                        for o in snap["outbound"]:
+                            key = (f"out:{o['lhost']}:{o['lport']}:"
+                                   f"{o['rhost']}:{o['rport']}")
+                            if key in ssh_seen:
+                                continue
+                            ssh_seen.add(key)
+                            ssh_emit({"kind": "outbound",
+                                      "evidence": "OBSERVED", "account": None,
+                                      "lhost": o["lhost"], "lport": o["lport"],
+                                      "rhost": o["rhost"], "rport": o["rport"]})
+                    if snap["listening"] is not None:
+                        if ssh_prev_listen is not None \
+                                and snap["listening"] != ssh_prev_listen:
+                            ssh_emit({"kind": "ssh-daemon",
+                                      "evidence": "OBSERVED", "account": None,
+                                      "from": ssh_prev_listen,
+                                      "to": snap["listening"]},
+                                     notify_local=False)
+                        ssh_prev_listen = snap["listening"]
+                    if snap["x11vnc"] and x11vnc_prev \
+                            and snap["x11vnc"] != x11vnc_prev:
+                        ssh_emit({"kind": "ssh-x11vnc",
+                                  "evidence": "OBSERVED",
+                                  "service": "x11vnc.service",
+                                  "from": x11vnc_prev.get("ActiveState"),
+                                  "to": snap["x11vnc"].get("ActiveState")})
+                    if snap["x11vnc"]:
+                        x11vnc_prev = snap["x11vnc"]
+                    c = snap["xclients"]
+                    if c is not None and xclient_base is not None \
+                            and c > xclient_base + 2:
+                        ssh_emit({"kind": "ssh-xclient",
+                                  "evidence": "OBSERVED", "account": None,
+                                  "count": c, "baseline": xclient_base},
+                                 notify_local=False)
+                    if c is not None:
+                        xclient_base = c
+                    ks = snap["keys"]
+                    for rel, st in ks.items():
+                        if key_prev.get(rel) != st and key_prev.get(rel) is not None:
+                            log_alert(f"ssh key file changed: {rel} "
+                                      f"{key_prev.get(rel)} -> {st}")
+                    key_prev = ks
+                    recs, wtmp_state, wnote = wtmp_new_records(wtmp_state)
+                    if wnote in ("rotated", "truncated", "unsupported"):
+                        log_alert(f"ssh wtmp {wnote}")
+                    if recs:
+                        log_alert(f"ssh history: {len(recs)} new remote login "
+                                  f"record(s): " + ", ".join(
+                                      f"{r['user']}@{r['host']}"
+                                      for r in recs[:5]))
+                    if len(ssh_seen) > SSH_SEEN_MAX:
+                        ssh_seen = set(list(ssh_seen)[-SSH_SEEN_MAX:])
 
                 # 4c) CPU: neutral observation, log only, never notify
                 if pid and ticks is not None:
@@ -2538,12 +4066,26 @@ def follow_live(args):
                 write_state(snapshot(
                     conns, sockets, listening_ports(),
                     {"input_watch": bool(xtest),
-                     "xi_log_bytes": os.path.getsize(XI_LOG)
-                     if os.path.exists(XI_LOG) else 0,
+                     "xi_log_bytes": safe_size(XI_LOG),
                      "unavailable": {
                          "x11vnc": sx is None,
                          "autorepeat": autorepeat_state is None,
                          "xtest": not xtest,
+                     },
+                     "ssh": {
+                         "sources": ssh_sources,
+                         "seen": sorted(ssh_seen)[-SSH_SEEN_MAX:],
+                         "sessions_seen": sorted(ssh_sessions_seen),
+                         "wtmp": wtmp_state,
+                         "x11vnc": x11vnc_prev,
+                         "xclients": xclient_base,
+                         "keys": key_prev,
+                         "outbound": (ssh_state["outbound"] or []),
+                         "sessions": [
+                             {k: s.get(k) for k in
+                              ("loginctl_sid", "account", "uid",
+                               "remote_host", "service", "line")}
+                             for s in (ssh_state["sessions"] or [])],
                      },
                      "recent": list(recent)}))
                 last_state_write = now
@@ -2554,12 +4096,26 @@ def follow_live(args):
         print("\nstopped")
         return 0
     finally:
+        for _sig, _prev in saved_signals.items():
+            try:
+                signal.signal(_sig, _prev)
+            except (OSError, ValueError):
+                pass
         if tail:
             tail.close()
         if xi_tail:
             xi_tail.close()
         if xinput_proc and xinput_proc.poll() is None:
             xinput_proc.terminate()
+            try:
+                xinput_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                xinput_proc.kill()
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 # -------------------------------------------------------------------- menu
@@ -2569,11 +4125,13 @@ def follow_live(args):
 BROWSERS = [
     {"name": "firefox", "family": "firefox",
      "roots": [("firefox (native)", "~/.mozilla/firefox"),
+               ("firefox (snap)", "~/snap/firefox/common/.mozilla/firefox"),
                ("firefox (flatpak)",
                 "~/.var/app/org.mozilla.firefox/.mozilla/firefox")],
      "comms": ["firefox"], "flatpak_ids": ["org.mozilla.firefox"]},
     {"name": "chromium", "family": "chromium",
      "roots": [("chromium (native)", "~/.config/chromium"),
+               ("chromium (snap)", "~/snap/chromium/common/chromium"),
                ("chromium (flatpak)",
                 "~/.var/app/org.chromium.Chromium/config/chromium")],
      "comms": ["chromium", "chromium-browse"],
@@ -2857,34 +4415,113 @@ def privacy_status():
     print("\nA root operator can hide all of the above. This is a best-effort view.")
 
 
-def lock_session():
-    """Lock over the session bus first, then loginctl. Returns (ok, how)."""
+LOCK_SOCKET = "/run/42-lock/control"
+# Bounded poll for the authoritative `locked: true` state after a lock command.
+# The supervisor's reply and its state-file write are not contractually
+# ordered, so the reply is never trusted on its own.
+LOCK_CONFIRM_TIMEOUT = _env_num("VNC_WATCH_LOCK_CONFIRM_TIMEOUT", 5.0, float)
+LOCK_CONFIRM_POLL = 0.2
+
+
+def _lock_via_supervisor():
+    """Ask the 42 lock supervisor to lock. Returns True on a `LOCKED` reply.
+
+    Some managed images (e.g. a 42 school seat) route the lock through a
+    supervisor on this socket; GNOME's ScreenShield is absent there, so the
+    D-Bus and loginctl paths silently do nothing. A `LOCKED` reply is the
+    supervisor's acceptance — not proof the seat is locked (see
+    `_confirm_lock`)."""
+    if not os.path.exists(LOCK_SOCKET):
+        return False
     try:
-        r = subprocess.run(["gdbus", "call", "--session",
-                            "--dest", "org.gnome.ScreenSaver",
-                            "--object-path", "/org/gnome/ScreenSaver",
-                            "--method", "org.gnome.ScreenSaver.Lock"],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            return True, "org.gnome.ScreenSaver.Lock"
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(15)
+            conn.connect(LOCK_SOCKET)
+            conn.sendall(b"lock\n")
+            return conn.recv(64) == b"LOCKED\n"
+    except OSError:
+        return False
+
+
+def _confirm_lock(before_locked, timeout=None):
+    """Verify a lock request against the authoritative seat-state file.
+
+    Polls VNC_WATCH_LOCK_FILE for `locked: true` until it holds or `timeout`
+    elapses. The socket reply and per-mechanism exit codes are not trusted, and
+    GNOME ScreenShield / loginctl are never used as the verification source.
+
+    `before_locked` is the `locked` value read before the command was sent, so
+    an already-locked seat is not credited to this request. Returns
+    (status, detail):
+
+      "locked"      -- was not locked before; now authoritatively locked
+      "already"     -- was already locked before the request (no transition)
+      "unconfirmed" -- never reached `locked: true` (missing/malformed file,
+                       permission error, stale state, or timeout)
+    """
+    timeout = LOCK_CONFIRM_TIMEOUT if timeout is None else timeout
+    deadline = time.monotonic() + max(0.0, timeout)
+    detail = "seat state unavailable"
+    while True:
+        state, detail = _locked_now()
+        if state is True:
+            if before_locked is True:
+                return "already", "seat was already locked before the request"
+            return "locked", "seat state reports locked"
+        if time.monotonic() >= deadline:
+            return "unconfirmed", detail
+        time.sleep(LOCK_CONFIRM_POLL)
+
+
+def lock_session():
+    """Send a lock and verify it. Returns (ok, how).
+
+    Tries, in order: the 42 lock supervisor (the real locker on a managed
+    seat), GNOME's ScreenSaver D-Bus service, then loginctl. Each is only a
+    *send*; the outcome is verified by `_confirm_lock` against the authoritative
+    seat-state file, never by trusting exit codes — `loginctl lock-session`
+    exits 0 on this seat without locking anything.
+    """
+    before, _ = _locked_now()
+    if _lock_via_supervisor():
+        status, why = _confirm_lock(before)
+        if status == "locked":
+            return True, "ft_lock (42 lock supervisor)"
+        if status == "already":
+            return True, "already locked (42 lock supervisor)"
+        return False, f"lock supervisor replied LOCKED but {why}"
+    try:
+        subprocess.run(
+            ["gdbus", "call", "--session",
+             "--dest", "org.gnome.ScreenSaver",
+             "--object-path", "/org/gnome/ScreenSaver",
+             "--method", "org.gnome.ScreenSaver.Lock"],
+            capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         pass
+    else:
+        status, _why = _confirm_lock(before)
+        if status == "locked":
+            return True, "org.gnome.ScreenSaver.Lock"
     user = os.environ.get("USER") or str(os.getuid())
     try:
-        out = subprocess.run(["loginctl", "show-user", user, "-p", "Sessions",
-                              "--value"], capture_output=True, text=True,
-                             timeout=5).stdout.split()
+        sids = subprocess.run(["loginctl", "show-user", user, "-p", "Sessions",
+                               "--value"], capture_output=True, text=True,
+                              timeout=5).stdout.split()
     except (OSError, subprocess.SubprocessError):
-        out = []
-    for sid in out:
+        sids = []
+    for sid in sids:
         try:
-            r = subprocess.run(["loginctl", "lock-session", sid],
-                               capture_output=True, text=True, timeout=5)
+            subprocess.run(["loginctl", "lock-session", sid],
+                           capture_output=True, text=True, timeout=5)
         except (OSError, subprocess.SubprocessError):
             continue
-        if r.returncode == 0:
+        status, _why = _confirm_lock(before)
+        if status == "locked":
             return True, f"loginctl lock-session {sid}"
-    return False, "no working lock mechanism (session bus and loginctl failed)"
+    return False, ("no working lock mechanism, or the seat state never "
+                   "reported locked (lock supervisor, session bus and "
+                   "loginctl failed)")
 
 
 def ask(prompt):
@@ -3031,10 +4668,11 @@ def menu_clear():
         print("nothing to clear (no browser or Discord data found)\n")
         return
     total = sum(_size_of(p) for _l, p, _k in items)
-    prompt = (f"Delete browser data and Discord storage? {len(items)} item(s), "
-              f"about {total / 1048576:.1f} MB — history, cookies, sessions, "
-              f"caches, autofill and saved logins. Bookmarks are kept. This "
-              f"logs you out of sites and Discord and cannot be undone.")
+    prompt = (f"Close browsers and delete their local data? {len(items)} "
+              f"item(s), about {total / 1048576:.1f} MB — history, cookies, "
+              f"sessions, caches, autofill and saved logins. Running browsers "
+              f"are closed automatically (SIGTERM, then SIGKILL); open tabs "
+              f"and unsaved work are lost. Cannot be undone.")
     if not confirm(prompt):
         print("cancelled\n")
         log_alert("menu action=clear outcome=cancelled")
@@ -3127,7 +4765,7 @@ TRAY_ICON_ACTIVE = os.path.join(STATE_DIR, "tray-active.png")
 TRAY_ICON_UNKNOWN = os.path.join(STATE_DIR, "tray-unknown.png")
 # A state.json older than this means monitoring cannot be trusted (the daemon
 # writes every ~5 s; 15 s of silence is a dead or wedged daemon).
-TRAY_STATE_MAX_AGE = int(os.environ.get("VNC_WATCH_STATE_MAX_AGE", "15"))
+TRAY_STATE_MAX_AGE = _env_num("VNC_WATCH_STATE_MAX_AGE", 15, int)
 
 
 def tray_state(state):
@@ -3222,87 +4860,183 @@ def tray_icons():
     return {k: v[0] for k, v in specs.items()}
 
 
-def quit_browsers(timeout=8.0):
-    """Ask this user's browsers to shut down gracefully (SIGTERM only, never
-    SIGKILL), then wait. Returns {'asked': int, 'survivors': [(pid, comm)]}.
+def _kill_if_ours(pid, sig):
+    """Send `sig` only if the pid is still this user's; never touch another UID."""
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
 
-    Survivors are reported, never forced. The wipe then skips any data whose
-    process is still running, so a live database is never deleted."""
-    procs = running_browsers()
-    for pid, _comm in procs:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    deadline = time.monotonic() + timeout
-    left = {pid: comm for pid, comm in procs}
+
+def _wait_gone(procs, timeout):
+    """Return the subset of {pid: comm} still alive after up to `timeout` s."""
+    left = dict(procs)
+    deadline = time.monotonic() + max(0.0, timeout)
     while left and time.monotonic() < deadline:
         left = {pid: comm for pid, comm in left.items()
                 if proc_state(pid) not in (None, "Z", "X")}
-        time.sleep(0.2)
-    return {"asked": len(procs),
-            "survivors": sorted((pid, comm) for pid, comm in left.items())}
+        if left:
+            time.sleep(0.2)
+    return left
+
+
+# SIGTERM grace, then SIGKILL grace. A Clear was explicit, so the second stage
+# needs no further confirmation. Overridable for slow machines / tests.
+BROWSER_TERM_GRACE = _env_num("VW_BROWSER_TERM_GRACE", 8.0, float)
+BROWSER_KILL_GRACE = _env_num("VW_BROWSER_KILL_GRACE", 4.0, float)
+
+
+def quit_browsers(term_grace=None, kill_grace=None):
+    """Terminate this user's browser processes: SIGTERM, then SIGKILL.
+
+    Only processes owned by this UID are ever signalled (`_kill_if_ours`
+    re-checks before every signal). SIGTERM is sent first; whatever survives
+    the grace period is SIGKILLed without a second confirmation, because Clear
+    was an explicit choice. Returns:
+
+        {'asked': int, 'killed': [pid, ...], 'survivors': [(pid, comm), ...],
+         'all_stopped': bool}
+
+    Survivors are processes that could not be killed (e.g. an unkillable
+    zombie owned by init, or an EPERM); they are reported and their data is
+    then skipped, never claimed as cleared.
+    """
+    term_grace = BROWSER_TERM_GRACE if term_grace is None else term_grace
+    kill_grace = BROWSER_KILL_GRACE if kill_grace is None else kill_grace
+    procs = running_browsers()
+    for pid, _comm in procs:
+        _kill_if_ours(pid, signal.SIGTERM)
+    left = _wait_gone(procs, term_grace)
+    killed = []
+    if left:
+        for pid, _comm in left.items():
+            if _kill_if_ours(pid, signal.SIGKILL):
+                killed.append(pid)
+        left = _wait_gone(left, kill_grace)
+    survivors = sorted((pid, comm) for pid, comm in left.items())
+    log_alert(f"clear: asked {len(procs)} browser proc(s) to quit, "
+              f"SIGKILLed {len(killed)}, {len(survivors)} survived")
+    return {"asked": len(procs), "killed": sorted(killed),
+            "survivors": survivors, "all_stopped": not survivors}
+
+
+def _ask_passphrase_gui(parent=None):
+    """GTK password prompt for the panel. Returns the passphrase or None."""
+    try:
+        from gi.repository import Gtk
+    except Exception:
+        return None
+    dlg = Gtk.Dialog(title="Vault passphrase", transient_for=parent, modal=True)
+    dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                    "Encrypt", Gtk.ResponseType.OK)
+    dlg.set_default_response(Gtk.ResponseType.OK)
+    box = dlg.get_content_area()
+    box.add(Gtk.Label(label="Passphrase for the encrypted archive "
+                            "(not stored anywhere):"))
+    entry = Gtk.Entry()
+    entry.set_visibility(False)
+    entry.set_activates_default(True)
+    box.add(entry)
+    dlg.show_all()
+    resp = dlg.run()
+    pw = entry.get_text() if resp == Gtk.ResponseType.OK else ""
+    dlg.destroy()
+    return pw or None
 
 
 def _tray_confirm_wipe(parent=None):
-    """Destructive confirm. Returns (decision, quit_first) where decision is
-    True (delete), False (cancel), or None (nothing to delete)."""
+    """Destructive confirm. Returns (decision, quit_first, encrypt, passphrase)
+    where decision is True (proceed), False (cancel), or None (nothing to do)."""
     from gi.repository import Gtk
     items = wipe_targets()
     if not items:
-        return None, False
+        return None, False, False, None
     total = sum(_size_of(p) for _l, p, _k in items)
     dlg = Gtk.MessageDialog(transient_for=parent, modal=True,
                             message_type=Gtk.MessageType.WARNING,
                             buttons=Gtk.ButtonsType.NONE)
     dlg.set_title("Clear browser + Discord data")
-    dlg.set_markup("<b>Delete browser data and Discord storage?</b>")
+    dlg.set_markup("<b>Close browsers and clear local data?</b>")
     dlg.format_secondary_text(
         f"{len(items)} item(s), about {total / 1048576:.1f} MB — history, "
         f"downloads, cookies, sessions, caches, autofill, and saved logins "
         f"across Firefox, Chrome, Chromium, Brave, Edge, Vivaldi and Opera, "
-        f"plus Discord storage. Bookmarks are kept. This logs you out of "
-        f"sites and Discord and cannot be undone.")
+        f"plus Discord storage. Open tabs and unsaved work will be lost: "
+        f"running browsers are closed automatically (SIGTERM, then SIGKILL). "
+        f"Deleting cannot be undone; the encrypted option keeps a restorable "
+        f"archive instead. This does not affect screen monitoring or VNC.")
     dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
-    dlg.add_button("Delete now", Gtk.ResponseType.OK)
+    dlg.add_button("Proceed", Gtk.ResponseType.OK)
     dlg.set_default_response(Gtk.ResponseType.CANCEL)
-    chk = Gtk.CheckButton.new_with_label(
-        "Quit running browsers first (recommended)")
-    chk.set_active(True)
-    dlg.get_content_area().add(chk)
+    chk_enc = Gtk.CheckButton.new_with_label(
+        "Encrypt a recoverable archive instead of deleting")
+    chk_enc.set_active(False)
+    dlg.get_content_area().add(chk_enc)
     dlg.show_all()
     resp = dlg.run()
-    quit_first = chk.get_active()
+    encrypt = chk_enc.get_active()
     dlg.destroy()
-    return resp == Gtk.ResponseType.OK, quit_first
+    ok = resp == Gtk.ResponseType.OK
+    pw = None
+    if ok and encrypt:
+        pw = (os.environ.get("VNC_WATCH_VAULT_PASSPHRASE")
+              or _ask_passphrase_gui(parent))
+        if not pw:
+            return False, True, False, None   # passphrase cancelled
+    return ok, True, encrypt, pw
 
 
-def _wipe_and_summary(quit_first):
-    """Run the wipe synchronously. Returns (parts, quit, result).
+def _confirm_parts(result):
+    """Accept both (ok, quit) and (ok, quit, encrypt, passphrase) shapes."""
+    if len(result) == 2:
+        return result[0], result[1], False, None
+    return result
 
-    Kept separate from _tray_do_wipe so a one-shot `clear` process can run it
-    to completion instead of relying on a thread that dies with the process."""
-    q = (quit_browsers() if quit_first
-         else {"asked": 0, "survivors": []})
-    res = wipe_private_data(apply=True)
-    parts = [f"Cleared {len(res['items'])} item(s), "
+
+def _wipe_and_summary(quit_first=True, encrypt=False, passphrase=None):
+    """Close browsers, then wipe synchronously. Returns (parts, quit, result).
+
+    Browsers are always terminated first (SIGTERM, then SIGKILL after the
+    grace period): Clear is an explicit choice, so unsaved tabs are accepted as
+    lost and no manual close is requested. `quit_first` is kept for existing
+    callers but no longer gates the shutdown. Kept separate from _tray_do_wipe
+    so a one-shot `clear` process can run it to completion instead of relying
+    on a thread that dies with the process."""
+    q = quit_browsers()
+    res = wipe_private_data(apply=True, encrypt=encrypt, passphrase=passphrase)
+    verb = "Archived" if encrypt else "Cleared"
+    parts = [f"{verb} {len(res['items'])} item(s), "
              f"{res['total'] / 1048576:.1f} MB"]
+    if res["vault"]:
+        parts.append(f"vault {os.path.basename(res['vault'])} "
+                     f"(restore with clear --restore)")
     if q["asked"]:
-        parts.append(f"asked {q['asked']} browser proc(s) to quit")
+        closed = f"closed {q['asked']} browser proc(s)"
+        if q["killed"]:
+            closed += f", SIGKILLed {len(q['killed'])}"
+        parts.append(closed)
     if q["survivors"]:
-        parts.append(f"{len(q['survivors'])} refused to exit — their "
-                     f"data was skipped")
-    if res["skipped"]:
-        parts.append(f"{len(res['skipped'])} skipped (app running)")
+        who = ", ".join(f"{comm} (pid {pid})" for pid, comm in q["survivors"])
+        parts.append(f"{len(q['survivors'])} could not be closed — "
+                     f"{who} — their data was NOT cleared")
+    if res["remaining"]:
+        parts.append(f"{len(res['remaining'])} item(s) remain")
     if res["errors"]:
         parts.append(f"{len(res['errors'])} error(s)")
     return parts, q, res
 
 
-def _tray_do_wipe(quit_first):
+def _tray_do_wipe(quit_first, encrypt=False, passphrase=None):
     def work():
         try:
-            parts, q, res = _wipe_and_summary(quit_first)
+            if encrypt or passphrase:
+                parts, q, res = _wipe_and_summary(quit_first, encrypt,
+                                                  passphrase)
+            else:
+                parts, q, res = _wipe_and_summary(quit_first)
             notify("vnc-watch", "; ".join(parts), "viewer",
                    urgent=bool(q["survivors"] or res["errors"]))
         except Exception as exc:
@@ -3310,18 +5044,86 @@ def _tray_do_wipe(quit_first):
     threading.Thread(target=work, daemon=True).start()
 
 
-def clear_command():
+def _vault_list_command():
+    archives = vault_archives()
+    if not archives:
+        print("no encrypted archives")
+        return 0
+    print("== encrypted vault ==\n")
+    for path, size, mtime in archives:
+        print(f"{datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M:%S}  "
+              f"{size / 1048576:8.1f} MB  {path}")
+    print("\nrestore with: vnc-watch clear --restore [ARCHIVE]")
+    return 0
+
+
+def _confirm_wipe_cli(encrypt=False):
+    """Fallback confirmation when GTK is unavailable (SSH / no display)."""
+    items = wipe_targets()
+    if not items:
+        return None, False, False, None
+    total = sum(_size_of(p) for _l, p, _k in items)
+    mode = "encrypt" if encrypt else "delete"
+    print(f"{len(items)} item(s), about {total / 1048576:.1f} MB")
+    print("running browsers will be closed (SIGTERM, then SIGKILL); open "
+          "tabs and unsaved work are lost")
+    print(f"mode: {mode}"
+          + (" (AES-256 archive, restorable with clear --restore)"
+             if encrypt else " (cannot be undone)"))
+    if not sys.stdin.isatty():
+        print("refusing: no GUI and no terminal to confirm on")
+        return False, False, False, None
+    try:
+        answer = input(f"Type '{mode}' to proceed: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False, False, False, None
+    if answer != mode:
+        return False, False, False, None
+    pw = vault_passphrase(prompt=True) if encrypt else None
+    if encrypt and not pw:
+        return False, False, False, None
+    return True, True, encrypt, pw
+
+
+def clear_command(encrypt=False, restore=None, list_vault=False):
     """One-shot `clear`: guard, confirm (GTK), then wipe to completion.
 
     The panel/GNOME extension spawns this as its own process, so the work must
     finish before the process exits — no fire-and-forget thread here."""
+    if list_vault:
+        return _vault_list_command()
+    if restore is not None:
+        try:
+            outcome = vault_restore(restore)
+        except (OSError, RuntimeError) as exc:
+            msg = f"restore failed: {exc}"
+            print(msg, flush=True)
+            notify("vnc-watch", msg, "viewer")
+            return 2
+        n = len(outcome["restored"])
+        msg = f"restored {n} item(s) from {restore}"
+        if outcome["conflicts"]:
+            msg += f"; {len(outcome['conflicts'])} left in place (already present)"
+            for rel, reason in outcome["conflicts"]:
+                print(f"  kept existing {rel}: {reason}", flush=True)
+        notify("vnc-watch", msg, "viewer", urgent=False)
+        print(msg, flush=True)
+        return 0
     locked, why = active_lock_window()
     if locked:
         msg = f"clear refused: {why} (exam/lock window active)"
         notify("vnc-watch", msg, "viewer")
         print(msg, flush=True)
         return 1
-    ok, quit_first = _tray_confirm_wipe()
+    try:
+        ok, quit_first, gui_encrypt, passphrase = _confirm_parts(
+            _tray_confirm_wipe())
+        encrypt = encrypt or gui_encrypt
+        if encrypt and not passphrase:
+            passphrase = vault_passphrase()
+    except Exception:
+        # No display / GTK: confirm on the terminal instead of crashing.
+        ok, quit_first, encrypt, passphrase = _confirm_wipe_cli(encrypt)
     if ok is None:
         msg = "nothing to clear (no browser or Discord data found)"
         notify("vnc-watch", msg, "viewer", urgent=False)
@@ -3331,7 +5133,10 @@ def clear_command():
         print("cancelled", flush=True)
         return 1
     try:
-        parts, q, res = _wipe_and_summary(quit_first)
+        if encrypt or passphrase:
+            parts, q, res = _wipe_and_summary(quit_first, encrypt, passphrase)
+        else:
+            parts, q, res = _wipe_and_summary(quit_first)
     except Exception as exc:
         notify("vnc-watch", f"clear failed: {exc}", "viewer")
         print(f"clear failed: {exc}", flush=True)
@@ -3340,7 +5145,7 @@ def clear_command():
     notify("vnc-watch", msg, "viewer",
            urgent=bool(q["survivors"] or res["errors"]))
     print(msg, flush=True)
-    return 0
+    return 2 if q["survivors"] else 0
 
 
 def _tray_clear():
@@ -3349,13 +5154,14 @@ def _tray_clear():
         notify("vnc-watch", f"clear refused: {why} (exam/lock window active)",
                "viewer")
         return
-    ok, quit_first = _tray_confirm_wipe()
+    ok, quit_first, encrypt, passphrase = _confirm_parts(
+        _tray_confirm_wipe())
     if ok is None:
         notify("vnc-watch", "nothing to clear (no browser or Discord data found)",
                "viewer", urgent=False)
         return
     if ok:
-        _tray_do_wipe(quit_first)
+        _tray_do_wipe(quit_first, encrypt, passphrase)
 
 
 def _tray_ask(title, markup, detail):
@@ -3707,10 +5513,10 @@ def main():
         prog="vnc-watch",
         description="Unprivileged, best-effort remote-viewing detection.")
     ap.add_argument("command", nargs="?",
-                    choices=["watch", "audit", "portal", "kick", "popup",
+                    choices=["watch", "audit", "ssh", "portal", "kick", "popup",
                              "channels", "lockdown", "shortcut", "xwatch",
                              "tray", "menu", "menu-window", "clear", "lock"],
-                    help="watch (default), audit, portal, kick, popup, "
+                    help="watch (default), audit, ssh, portal, kick, popup, "
                          "channels, lockdown, shortcut, xwatch, tray, menu, "
                          "menu-window, clear, lock")
     ap.add_argument("--audit", action="store_true",
@@ -3752,6 +5558,15 @@ def main():
                     help="with `shortcut`: remove the hotkey")
     ap.add_argument("--binding", default="<Control><Alt><Shift>l",
                     help="with `shortcut`: key combination to bind")
+    ap.add_argument("--encrypt", action="store_true",
+                    help="with `clear`: store an encrypted, restorable archive "
+                         "instead of deleting (passphrase from "
+                         "VNC_WATCH_VAULT_PASSPHRASE or a prompt)")
+    ap.add_argument("--restore", nargs="?", const="latest", metavar="ARCHIVE",
+                    help="with `clear`: decrypt an archive back into place "
+                         "(default: the newest one)")
+    ap.add_argument("--vault-list", action="store_true",
+                    help="with `clear`: list encrypted archives")
     args = ap.parse_args()
 
     cmd = args.command or "watch"
@@ -3762,6 +5577,9 @@ def main():
 
     if cmd == "audit":
         return audit()
+    if cmd == "ssh":
+        ensure_state_dir()
+        return ssh_audit_section()
     if cmd == "portal":
         ensure_state_dir()
         return portal_status()
@@ -3793,7 +5611,8 @@ def main():
         return menu_window_command()
     if cmd == "clear":
         ensure_state_dir()
-        return clear_command()
+        return clear_command(encrypt=args.encrypt, restore=args.restore,
+                             list_vault=args.vault_list)
     if cmd == "lock":
         ensure_state_dir()
         return lock_command()

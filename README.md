@@ -100,6 +100,7 @@ python3 vnc-watch.py watch --input-watch
 |---|---|
 | `vnc-watch watch` | run the detector (default command) |
 | `vnc-watch audit` | classify every connection in the current VNC log |
+| `vnc-watch ssh` | SSH subsystem view: sessions, scoped processes, connections, wtmp, x11vnc |
 | `vnc-watch portal` | one-shot screenshot/RDP/VNC status report |
 | `vnc-watch menu` | interactive menu of all actions |
 | `vnc-watch kick [--yes] [--dry-run]` | close a running VNC server |
@@ -133,6 +134,100 @@ Tiers come from protocol evidence, never from "a human is watching":
 
 Supporting signals that never change a tier: xdamage objects, x11vnc
 `client_count`, X client count, CPU use, autorepeat flips, XTEST events.
+
+---
+
+## SSH (separate subsystem)
+
+SSH is detected, worded and stored on its own terms. It never feeds the
+VNC/RDP tiers above, never changes `REMOTE_PORTS`, and leaves all existing VNC
+detection untouched. Everything here runs unprivileged.
+
+Event kinds: `ssh-session`, `ssh-connection`, `outbound`, `ssh-command`,
+`ssh-x11vnc`, `ssh-daemon`, `ssh-history`, `ssh-keychange`.
+
+### Evidence ladder
+
+A TCP connection to `:22` is **never** called a login. Only an explicit, readable
+auth record correlated by account + source + time may be treated as
+`AUTHENTICATED`, and even then it names the **account**, never the human at the
+keyboard. Default evidence level is `OBSERVED`.
+
+| Source | What it gives | Privilege |
+|---|---|---|
+| `loginctl` | remote sessions (`Remote=yes`/`RemoteHost`/`Service=sshd`), account, Leader PID, TTY | none |
+| `/proc` | processes scoped to the session (cgroup `session-<id>.scope`, else Leader) | none |
+| `ss` | established inbound TCP to `:22` | none |
+| `/var/log/wtmp` | **historical** remote-login records, read forward only | none |
+| `systemctl show` | `x11vnc.service` ActiveState/UnitFileState | none |
+| `/var/log/auth.log`, `/var/log/btmp` | login method / failed logins, only if readable | adm/root (usually not) |
+
+### loginctl id vs POSIX session id
+
+They are different things. The event keeps `loginctl_sid` (e.g. `183`) and
+`leader_pid` separately; process correlation uses the session cgroup
+(`/user.slice/.../session-<id>.scope`, primary) or the `Leader` PID (secondary).
+The POSIX `process_sid` (stat field 6) is recorded for identity but is **not**
+the loginctl id. A process's identity is `loginctl_sid:pid:start_ticks`, so a
+repeated poll is stable while a later run of the same binary is still new.
+
+### Process / command visibility
+
+On by default through `/proc`, scoped only to descendants in an identified SSH
+session. It records exe, PID, PPID, session and start time. `/proc` is a
+**point-in-time snapshot**, not a command history. When `/proc` is restricted the
+subsystem reports a degraded source and keeps running.
+
+Raw `argv` is **never** persisted by default. Command capture is off unless
+`VNC_WATCH_SSH_CMDLINE=1`; when enabled only a redacted summary is stored —
+likely secrets masked and script bodies (`-c`/`--command`) replaced. `environ`
+is never read. No process is ever signalled, terminated, or interfered with.
+
+### x11vnc
+
+`x11vnc.service` state changes are recorded as a **service-state observation**
+with `cause: unknown`. They are never attributed to a specific account.
+
+### Client-side (outbound) connections
+
+Separately from inbound sessions, the subsystem records **outbound** established
+TCP connections this host opens to a monitored destination port (`22`, `3389`,
+`5900`–`5903`, `11100`). It reports the **connection only**: local and remote
+endpoint plus the destination port. It does **not** attribute a process or a
+user, does **not** detect SSH tunnels or port forwards as such, and does **not**
+indicate that a remote screen is being viewed or controlled. A port match is
+`OBSERVED`, nothing more.
+
+The server side is inferred by port. A local socket is treated as the server
+side only when a listener is actually bound to that local port; if no listener
+exists, a socket on a service port is reported rather than dropped. When
+listener information is unavailable the check stays conservative and skips it.
+Residual limitation: a host that both listens on a service port and uses that
+same port as a *source* port for a client connection (explicit bind, or a port
+range that includes it) masks that client socket as server-side.
+
+This signal never feeds the viewer tiers and never includes command data. It is
+**local-only** — never webhooked — because outbound traffic is common on a
+workstation. Disable it entirely with `VNC_WATCH_SSH_OUTBOUND=0`.
+
+### wtmp / history
+
+The record size is validated against the file (default 384) with a first-record
+sanity check; an unsupported layout is reported, not guessed. Rotation (inode
+change) and truncation (size below the stored offset) are handled, partial
+records are held until complete, and history is kept separate from live state.
+Old records are baselined at startup and **never replayed**.
+
+### Webhook
+
+Metadata only: event type, account, source, timestamp, loginctl session id and
+evidence level. Raw cmdlines, script bodies and environment are never sent.
+Only `bocal` sessions/commands and unattributed connections/service changes
+leave the machine; another account's activity stays local unless explicitly
+allowed. Sends are deduplicated per session/process with a cooldown and a global
+rate cap; suppressed sends are logged locally, never silently dropped. The local
+audit trail is written independently of webhook delivery, and a webhook failure
+never stops monitoring.
 
 ---
 
@@ -182,17 +277,17 @@ make install LOCKFILE=/run/seat-lock/seat0.json
 
 ### What the wipe removes
 
-Supported browsers — **stable native and Flatpak** installs:
+Supported browsers — **stable native, Snap and Flatpak** installs:
 
-| Browser | Native root | Flatpak app-id |
-| --- | --- | --- |
-| Firefox | `~/.mozilla/firefox` | `org.mozilla.firefox` |
-| Chromium | `~/.config/chromium` | `org.chromium.Chromium` |
-| Google Chrome | `~/.config/google-chrome` | `com.google.Chrome` |
-| Brave | `~/.config/BraveSoftware/Brave-Browser` | `com.brave.Browser` |
-| Microsoft Edge | `~/.config/microsoft-edge` | `com.microsoft.Edge` |
-| Vivaldi | `~/.config/vivaldi` | `com.vivaldi.Vivaldi` |
-| Opera | `~/.config/opera` (or `Default/`) | `com.opera.Opera` |
+| Browser | Native root | Snap root | Flatpak app-id |
+| --- | --- | --- | --- |
+| Firefox | `~/.mozilla/firefox` | `~/snap/firefox/common/.mozilla/firefox` | `org.mozilla.firefox` |
+| Chromium | `~/.config/chromium` | `~/snap/chromium/common/chromium` | `org.chromium.Chromium` |
+| Google Chrome | `~/.config/google-chrome` | — | `com.google.Chrome` |
+| Brave | `~/.config/BraveSoftware/Brave-Browser` | — | `com.brave.Browser` |
+| Microsoft Edge | `~/.config/microsoft-edge` | — | `com.microsoft.Edge` |
+| Vivaldi | `~/.config/vivaldi` | — | `com.vivaldi.Vivaldi` |
+| Opera | `~/.config/opera` (or `Default/`) | — | `com.opera.Opera` |
 
 Every profile in a root is cleaned (`Default`, `Profile 1`, ...; Firefox
 profiles from `profiles.ini`; Opera's legacy root-level layout). Per profile
@@ -201,6 +296,7 @@ the following are removed:
 - **Chromium-family** (Chromium, Chrome, Brave, Edge, Vivaldi, Opera):
   `History`, `Visited Links`, `Web Data`, `Login Data`, `Login Data For
   Account`, `Affiliation Database`, `Cookies`, `Network/Cookies`, `Sessions`,
+  `Current Session`, `Current Tabs`, `Last Session`, `Last Tabs`,
   `Session Storage`, `Local Storage`, `IndexedDB`, `Cache`, `Code Cache`,
   `GPUCache`, `Service Worker`, `Shared Dictionary`, `Storage`, and the
   network-state files — each database file is deleted **together with its
@@ -227,19 +323,73 @@ Per Discord (`discord`, `discordcanary`, `discordptb`, `BetterDiscord`):
 `Cache`, `Code Cache`, `GPUCache`, `Local Storage`, `Session Storage`,
 `IndexedDB`, `logs`, `Network Persistent State`, `Service Worker`.
 
+**Clear closes running browsers for you.** On an explicit Clear, every
+supported browser process owned by your UID is terminated automatically —
+SIGTERM first, then SIGKILL after a short grace period (`VW_BROWSER_TERM_GRACE`,
+default 8 s, then `VW_BROWSER_KILL_GRACE`, default 4 s) — because you chose
+Clear and accepted losing open tabs and unsaved work. No manual close is
+requested, and the SIGKILL needs no second confirmation. Only processes owned
+by your UID are ever signalled (the UID is re-checked immediately before each
+signal); other users' processes and unrelated applications are never touched.
+A process that cannot be killed is reported, and its data is left in place and
+reported as remaining — never claimed cleared. This is local-data cleanup only:
+it does not stop root-level screen monitoring, VNC viewing, screenshots, or
+remote access.
+
 A category whose application is still running is skipped rather than deleted
 out from under it, and any individual file a same-user process holds open is
-skipped too; the tray's "quit running browsers first" option SIGTERMs browsers
-and reports any that refuse to exit (their data is then skipped). Every
-removal is logged with its size, and every skip or failure is reported. Paths
-outside your home are refused and symlinks are never followed out of it.
+skipped too; every removal is logged with its size, and every skip or failure
+is reported. Paths outside your home are refused and symlinks are never
+followed out of it. The same shutdown runs before Encrypt mode archives its
+data.
+
+### Encrypt instead of delete
+
+The action window has a second mode: **encrypt a recoverable archive instead
+of deleting**. The same eligible files are written into one AES-256 archive
+under `~/.local/state/vnc-watch/vault/`; the archive is then decrypted once and
+every member's SHA-256 re-checked against a per-file manifest recorded at
+archive time. Only if all of that holds are the originals removed. If the
+archive cannot be created or verified, nothing is deleted (fail closed).
+
+```bash
+VNC_WATCH_VAULT_PASSPHRASE='...' vnc-watch clear --encrypt
+vnc-watch clear --vault-list                 # archives, size, date
+VNC_WATCH_VAULT_PASSPHRASE='...' vnc-watch clear --restore        # newest
+VNC_WATCH_VAULT_PASSPHRASE='...' vnc-watch clear --restore FILE   # specific
+```
+
+The archive is an authenticated envelope: `VWVAULT1` magic ‖ 16-byte random
+salt ‖ HMAC-SHA256 ‖ ciphertext. The MAC (encrypt-then-MAC) is computed over
+the magic, salt and ciphertext with a key derived from the passphrase by
+PBKDF2-HMAC-SHA256 (200000 iterations), and it is **verified before anything is
+decrypted** — so a wrong passphrase, a flipped byte, a truncation or a modified
+archive is rejected at the MAC, not silently decrypted. This is what makes the
+`openssl` path authenticated; its raw AES-256-CBC has no integrity of its own.
+
+`gpg` is used when present (symmetric, `--cipher-algo AES256`), otherwise
+`openssl enc -aes-256-cbc -pbkdf2`. The passphrase is read from
+`VNC_WATCH_VAULT_PASSPHRASE` or prompted for, passed to the cipher over a file
+descriptor (never argv), and **never stored**. From the panel you are asked for
+it in a GTK dialog. The archive itself is 0600.
+
+Restore verifies the MAC and every member hash first, extracts into a staging
+directory, then moves members into place **without clobbering**: existing files
+are left untouched and reported as conflicts, and absolute paths, `..` members,
+links, special files, duplicate members and symlinked destination parents are
+refused. The result names the restored members and every conflict. A wipe
+reports `removed` and `remaining` lists, so it is always clear which originals
+were deleted and which were left — there is no atomic rollback.
+
+Because encryption is a *recoverable* mode, it is not a privacy guarantee
+against someone who later obtains the passphrase, and the archive grows with
+the data you chose to keep.
 
 > **Known limits:** deleting `Login Data` removes the stored ciphertext, but
 > the OS-keyring master key (`Chrome Safe Storage`) and Firefox's NSS password
 > are left in place; synced passwords/history can return from a signed-in
-> account; and channel variants (Beta/Dev/Canary/Snapshot) plus Snap installs
-> are not yet covered. Cookies and caches are removed as whole files, so
-> affected sites log you out.
+> account; and channel variants (Beta/Dev/Canary/Snapshot) are not covered.
+> Cookies and caches are removed as whole files, so affected sites log you out.
 
 ---
 
@@ -349,6 +499,38 @@ vnc-watch shortcut --binding '<Control><Alt><Shift>k'
 The sequence is deliberate: eviction and locking happen locally first, and the
 network notification is sent only afterwards, so a slow webhook cannot delay
 the lock.
+
+### How the lock is sent and verified
+
+`lock` (and `lockdown`) sends the lock through, in order:
+
+1. the **42 lock supervisor** socket `/run/42-lock/control` (`lock` → `LOCKED`),
+2. GNOME's `org.gnome.ScreenSaver.Lock` over the session bus,
+3. `loginctl lock-session`.
+
+None of those replies is trusted on its own. After the command, the outcome is
+verified only against the seat-state file named by `VNC_WATCH_LOCK_FILE`: a lock
+is reported as **locked** only once that file authoritatively reports
+`"locked": true`. A seat that was already locked before the request is reported
+as **already locked** (a lock-without-transition, never credited to the
+request), and a missing, unreadable, malformed, or never-updated state file
+returns **unconfirmed** — never a false success. This matters because on a
+managed seat `loginctl lock-session` exits `0` while locking nothing, and GNOME
+ScreenShield may be absent entirely.
+
+Because verification reads `VNC_WATCH_LOCK_FILE`, that variable must be set for
+the process running the lock — the installed unit gets it via
+`Environment=`, and an interactive terminal needs it too:
+
+```bash
+export VNC_WATCH_LOCK_FILE=/run/42-lock/seat0.json
+vnc-watch lock                      # or run with the variable inline
+```
+
+The interval-based seat-lock guard (`active_lock_window`) reads the same file
+but through a separate field: it treats an active `"intervals"` span as a
+lock/exam window, while verification uses only the `"locked"` field, so a
+scheduled window is never mistaken for a successful lock action.
 
 ---
 
@@ -494,6 +676,8 @@ vnc-watch channels --set webhook_url=https://your-server/hook
 - VNC/RDP connection opens, or a new listener appears on a watched port
 - `CONFIRMED`/`PROBABLE` viewer detection
 - New login session (utmp or loginctl), including `user@pts/N from host`
+- SSH: new session, new connection with no correlated session, or `x11vnc.service`
+  state change (metadata only; bocal-scoped, see the SSH section)
 - Actions taken: popup choice, connection closed, data wiped, lockdown
 
 ---
@@ -519,6 +703,7 @@ Top-panel indicator (make panel-install):
     channels.json        0600, remote alert credentials
     xinput-xi2.log       XTEST dump, capped at 2 MB
     popup.lock           keeps one action window open at a time
+    watch.lock           flock: one live watcher at a time, holds its pid
     tray-idle.png        0600, generated tray icon (white)
     tray-active.png      0600, generated tray icon (red)
     tray-unknown.png     0600, generated tray icon (grey, no data)
@@ -530,6 +715,20 @@ atomic. The alert log rotates once at 5 MB to `vnc-watch.log.1`, so it cannot
 grow without bound. A full or unwritable volume fails closed: writes are
 skipped with an error on stderr and the daemon keeps running, disabling only
 XTEST input-watch if its dump cannot be opened.
+
+Robustness details:
+
+- Only one `watch` daemon can run: `watch.lock` is held with `flock`, so a
+  second copy exits `2` instead of double-alerting or racing on `state.json`.
+- `SIGTERM`/`SIGHUP` run the cleanup path (close the log tail, stop the
+  `xinput` child, release the lock) instead of leaving orphans behind.
+- Malformed `VNC_WATCH_*` numeric settings fall back to the documented default
+  with a one-line warning; a typo cannot stop `audit` or the daemon from
+  starting.
+- The log tailer survives rotation, in-place truncation and a temporarily
+  unreadable file, and bounds the buffer for an unterminated line (1 MiB).
+- `audit` streams the log instead of reading it whole, so a large
+  `x11vnc.log` cannot exhaust memory on a small home volume.
 
 ---
 
@@ -621,7 +820,8 @@ vnc-watch shortcut --remove   # remove the hotkey
   endpoint cannot stall detection.
 
 Environment variables: `VNC_WATCH_POPUP_TIMEOUT`, `VNC_WATCH_POPUP_AUTO`,
-`VNC_WATCH_LOCK_FILE` (seat-lock guard; unset = disabled),
+`VNC_WATCH_LOCK_FILE` (seat-lock guard and lock verification; unset = disabled),
+`VNC_WATCH_LOCK_CONFIRM_TIMEOUT` (lock-verify poll, default 5 s),
 `VNC_WATCH_X_EXEMPT_UIDS`, `VNC_WATCH_X_EXEMPT_COMMS`,
 `VNC_WATCH_X_EVICT_SELF` (`xwatch` targeting),
 `VNC_WATCH_ALERT_IDENTITY` (off-machine host/user; unset = private),
