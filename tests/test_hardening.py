@@ -342,10 +342,13 @@ for backend in available:
 print("\n== vault end-to-end + partial-deletion reporting ==")
 if available:
     backend = available[0]
-    prof = os.path.join(os.environ["HOME"], ".config", "chromium", "Default")
-    if os.path.isdir(prof):
-        shutil.rmtree(prof)
+    root = os.path.join(os.environ["HOME"], ".config", "chromium")
+    prof = os.path.join(root, "Default")
+    if os.path.isdir(root):
+        shutil.rmtree(root)
     _seed(prof)
+    with open(os.path.join(root, "Local State"), "wb") as fh:
+        fh.write(b'{"profile":{}}')          # root-level account/session cache
 
     res = M.wipe_private_data(apply=True, allow_running=True, encrypt=True,
                               passphrase="pw-test-123")
@@ -354,10 +357,13 @@ if available:
           not os.path.exists(os.path.join(prof, "History"))
           and not os.path.exists(os.path.join(prof, "Sessions")),
           (res["errors"], res["items"]))
-    check("encrypt mode preserves bookmarks",
-          os.path.isfile(os.path.join(prof, "Bookmarks")))
+    check("encrypt mode removed the whole profile root",
+          not os.path.exists(root))
+    check("encrypt mode archived the whole profile root (incl. bookmarks)",
+          any(p == root for p in res["removed"]), res["removed"])
 
-    # Q6: removed/remaining name exactly what stayed.
+    # Q6: removed/remaining name exactly what stayed — fail closed, no passphrase.
+    os.makedirs(prof, exist_ok=True)
     with open(os.path.join(prof, "History"), "wb") as fh:
         fh.write(b"keep-me")
     res2 = M.wipe_private_data(apply=True, allow_running=True, encrypt=True,
@@ -366,7 +372,7 @@ if available:
           os.path.isfile(os.path.join(prof, "History"))
           and any("vault" in e for e in res2["errors"]), res2["errors"])
     check("missing passphrase reports the survivor",
-          any(p.endswith("History") for p in res2["remaining"]),
+          any(p.startswith(root) for p in res2["remaining"]),
           res2["remaining"])
     check("nothing was reported removed on fail-closed",
           res2["removed"] == [], res2["removed"])
@@ -386,13 +392,16 @@ def _spawn_fake(ignore_term=False):
 
 
 def _clear_profile():
-    prof = os.path.join(os.environ["HOME"], ".config", "chromium", "Default")
+    root = os.path.join(os.environ["HOME"], ".config", "chromium")
+    prof = os.path.join(root, "Default")
     os.makedirs(os.path.join(prof, "Sessions"), exist_ok=True)
-    for rel in ("Cookies", "History", "Sessions/session"):
+    for rel in ("Cookies", "History", "Sessions/session", "Preferences"):
         with open(os.path.join(prof, rel), "wb") as fh:
             fh.write(b"x" * 64)
     with open(os.path.join(prof, "Bookmarks"), "wb") as fh:
         fh.write(b'{"roots":{}}')
+    with open(os.path.join(root, "Local State"), "wb") as fh:
+        fh.write(b'{"profile":{}}')
     return prof
 
 
@@ -501,7 +510,9 @@ check("clear closed the browser before wiping", q["all_stopped"]
 check("clear removed History/Cookies after closing",
       not os.path.exists(os.path.join(prof, "History"))
       and not os.path.exists(os.path.join(prof, "Cookies")), res["remaining"])
-check("clear kept bookmarks", os.path.exists(os.path.join(prof, "Bookmarks")))
+check("clear removed the whole profile root (fresh next launch)",
+      not os.path.exists(os.path.join(os.environ["HOME"], ".config",
+                                      "chromium")), res["remaining"])
 check("clear reports no remaining browser data",
       not any("History" in r or "Cookies" in r for r in res["remaining"]),
       res["remaining"])
@@ -543,7 +554,116 @@ check("a survivor keeps its browser data in place",
       os.path.exists(os.path.join(prof, "Cookies")) and q["survivors"], q)
 check("a survivor is not reported as cleared",
       any("could not be closed" in x for x in parts)
-      and any("Cookies" in r for r in res["remaining"]), (parts, res["remaining"]))
+      and any(p.startswith(os.path.join(os.environ["HOME"], ".config",
+                                        "chromium")) for p in res["remaining"]),
+      (parts, res["remaining"]))
+
+print("\n== clear: shutdown decoupled from wipe targets ==")
+
+
+def _rm_roots():
+    for stray in (".config/chromium", ".config/BraveSoftware",
+                  ".config/google-chrome", ".mozilla", ".config/microsoft-edge",
+                  ".config/vivaldi", ".config/opera"):
+        shutil.rmtree(os.path.join(os.environ["HOME"], stray),
+                      ignore_errors=True)
+
+
+# The predicate that gates the panel/tray/CLI confirm dialogs.
+check("_clear_has_work: targets only -> True",
+      M._clear_has_work([("chromium (native)", "/p", "remove")], []) is True)
+check("_clear_has_work: browsers only -> True",
+      M._clear_has_work([], [(1, "firefox")]) is True)
+check("_clear_has_work: neither -> False",
+      M._clear_has_work([], []) is False)
+
+# 1. No wipe targets, but a supported browser runs: it must still be closed,
+#    and the report must say no data targets were found (not "nothing to do").
+_rm_roots()
+p = _spawn_fake()
+M.running_discord = lambda: []
+M.running_browsers = lambda: [(p.pid, "firefox")] if p.poll() is None else []
+try:
+    parts, q, res = M._wipe_and_summary(encrypt=False)
+finally:
+    M.running_browsers = _orig_rb
+    M.running_discord = _orig_rd
+    if p.poll() is None:
+        p.kill()
+        p.wait()
+check("no-targets: running browser is still closed",
+      q["all_stopped"] and p.poll() is not None, q)
+check("no-targets: report says no data targets found",
+      res["items"] == [] and any("no supported browser" in x for x in parts),
+      parts)
+
+# 2. Wipe targets exist, no browser running: data is wiped anyway.
+_rm_roots()
+prof = _clear_profile()
+M.running_discord = lambda: []
+M.running_browsers = lambda: []
+try:
+    parts, q, res = M._wipe_and_summary(encrypt=False)
+finally:
+    M.running_browsers = _orig_rb
+    M.running_discord = _orig_rd
+check("targets + no browser: data is wiped",
+      bool(res["items"]) and not os.path.exists(
+          os.path.join(os.environ["HOME"], ".config", "chromium")), res)
+check("targets + no browser: nothing left in place",
+      res["remaining"] == [], res["remaining"])
+
+# 3. Neither targets nor a running browser: clean no-op.
+_rm_roots()
+M.running_discord = lambda: []
+M.running_browsers = lambda: []
+try:
+    targets, browsers, total = M._clear_survey()
+finally:
+    M.running_browsers = _orig_rb
+    M.running_discord = _orig_rd
+check("neither: survey is empty", targets == [] and browsers == []
+      and total == 0, (targets, browsers, total))
+check("neither: no work, no dialog",
+      M._clear_has_work(targets, browsers) is False)
+
+# 4. Clear and Encrypt both shut down before touching data (record order).
+def _shutdown_order(encrypt):
+    _rm_roots()
+    _clear_profile()
+    p = _spawn_fake()
+    seq = []
+    _oq, _ow = M.quit_browsers, M.wipe_private_data
+    M.running_discord = lambda: []
+    M.running_browsers = lambda: [(p.pid, "firefox")] if p.poll() is None else []
+
+    def rec_quit(*a, **k):
+        seq.append("quit")
+        return _oq(*a, **k)
+
+    def rec_wipe(*a, **k):
+        seq.append("wipe")
+        return _ow(*a, **k)
+
+    M.quit_browsers = rec_quit
+    M.wipe_private_data = rec_wipe
+    try:
+        M._wipe_and_summary(encrypt=encrypt,
+                            passphrase=("pw-order" if encrypt else None))
+    finally:
+        M.quit_browsers = _oq
+        M.wipe_private_data = _ow
+        M.running_browsers = _orig_rb
+        M.running_discord = _orig_rd
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+    return seq
+
+
+check("clear shuts down before wiping", _shutdown_order(False) == ["quit", "wipe"])
+check("encrypt shuts down before archiving",
+      _shutdown_order(True) == ["quit", "wipe"])
 
 print("\n== lock session ==")
 

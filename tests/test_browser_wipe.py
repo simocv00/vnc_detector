@@ -192,9 +192,7 @@ for d in CHROMIUM_DIRS:
 profs = M.discover_profiles(op, "opera")
 check("opera legacy root discovered", op in profs, str(profs))
 M.wipe_private_data(apply=True, allow_running=True)
-check("opera legacy History deleted", not os.path.exists(os.path.join(op, "History")))
-check("opera legacy Bookmarks PRESERVED (root layout)",
-      os.path.exists(os.path.join(op, "Bookmarks")))
+check("opera legacy root removed (full reset)", not os.path.exists(op))
 
 print("\n== firefox profiles.ini ==")
 home = fresh_home("ff-ini")
@@ -227,14 +225,10 @@ check("snap firefox discovers both profiles",
       {"aaa.default-release", "bbb.default"}, str(profs))
 res = M.wipe_private_data(apply=True, allow_running=True)
 check("snap wipe: no errors", res["errors"] == [], str(res["errors"][:2]))
-for name in ("aaa.default-release", "bbb.default"):
-    base = os.path.join(snap_root, name)
-    check(f"snap {name}: cookies removed",
-          not os.path.exists(os.path.join(base, "cookies.sqlite")), base)
-    check(f"snap {name}: places.sqlite (bookmarks) preserved",
-          os.path.exists(os.path.join(base, "places.sqlite")), base)
+check("snap firefox root removed (full reset)",
+      not os.path.exists(snap_root), snap_root)
 
-print("\n== GitHub-like session cookie removed, bookmarks preserved ==")
+print("\n== full profile reset removes session cookies and bookmarks alike ==")
 home = fresh_home("github")
 cdir = os.path.join(home, ".config", "chromium", "Default")
 os.makedirs(cdir, exist_ok=True)
@@ -254,15 +248,15 @@ with open(os.path.join(cdir, "Bookmarks"), "wb") as fh:
 with open(os.path.join(cdir, "History"), "wb") as fh:
     fh.write(b"history-bytes")
 res = M.wipe_private_data(apply=True, allow_running=True)
-check("github: Cookies database removed whole",
-      not os.path.exists(cookies_db), cdir)
+check("github: profile root removed whole",
+      not os.path.exists(os.path.join(home, ".config", "chromium")), cdir)
 check("github: no cookie record survives",
-      not any(os.path.exists(p) for p in
-              (cookies_db, cookies_db + "-wal", cookies_db + "-shm")))
-check("github: Bookmarks preserved",
-      os.path.exists(os.path.join(cdir, "Bookmarks")))
-check("github: History removed",
-      not os.path.exists(os.path.join(cdir, "History")))
+      not os.path.exists(cookies_db)
+      and not any(os.path.exists(p) for p in
+                  (cookies_db + "-wal", cookies_db + "-shm")))
+check("github: no History or Bookmarks survive a full reset",
+      not os.path.exists(os.path.join(cdir, "History"))
+      and not os.path.exists(os.path.join(cdir, "Bookmarks")))
 
 print("\n== wipe: chromium-family + firefox (allow_running) ==")
 home = fresh_home("wipe")
@@ -270,50 +264,32 @@ build_all(home, native=True, flatpak=True)
 res = M.wipe_private_data(apply=True, allow_running=True)
 check("no errors", res["errors"] == [], str(res["errors"][:3]))
 
-cdef = os.path.join(home, ".config", "google-chrome", "Default")
-check("chrome History deleted", not exists(cdef, "History"))
-check("chrome History-wal deleted", not exists(cdef, "History-wal"))
-check("chrome Login Data deleted", not exists(cdef, "Login Data"))
-check("chrome Web Data deleted", not exists(cdef, "Web Data"))
-check("chrome Cookies deleted", not exists(cdef, "Cookies"))
-check("chrome Cache deleted", not exists(cdef, "Cache"))
-check("chrome Bookmarks PRESERVED", exists(cdef, "Bookmarks"))
-check("chrome Preferences PRESERVED", exists(cdef, "Preferences"))
-check("chrome Profile 1 History deleted",
-      not exists(home, ".config/google-chrome/Profile 1/History"))
+# A full reset removes each browser's whole data directory, so nothing of the
+# profile (history, cookies, bookmarks, preferences, sessions) survives.
+croot = os.path.join(home, ".config", "google-chrome")
+check("chrome profile root removed", not os.path.exists(croot), croot)
+check("chrome History gone", not exists(home, ".config/google-chrome/Default/History"))
+check("chrome Bookmarks gone (full reset)",
+      not exists(home, ".config/google-chrome/Default/Bookmarks"))
+check("chrome Preferences gone (full reset)",
+      not exists(home, ".config/google-chrome/Default/Preferences"))
+check("chrome Profile 1 gone", not exists(home, ".config/google-chrome/Profile 1"))
 for name, rel in [("edge", ".config/microsoft-edge"),
-                  ("vivaldi", ".config/vivaldi")]:
-    base = os.path.join(home, rel, "Default")
-    check(f"{name} History deleted", not exists(base, "History"), base)
-    check(f"{name} Bookmarks PRESERVED", exists(base, "Bookmarks"), base)
-# opera native (Default layout)
-check("opera History deleted",
-      not exists(home, ".config/opera/Default/History"))
-check("opera Bookmarks PRESERVED",
-      exists(home, ".config/opera/Default/Bookmarks"))
-
-ff = os.path.join(home, ".mozilla", "firefox", "abc.default-release")
-check("firefox places PRESERVED", exists(ff, "places.sqlite"))
-check("firefox cookies deleted", not exists(ff, "cookies.sqlite"))
-check("firefox formhistory deleted", not exists(ff, "formhistory.sqlite"))
-check("firefox logins.json deleted", not exists(ff, "logins.json"))
-check("firefox key4.db deleted", not exists(ff, "key4.db"))
-check("firefox key3.db deleted", not exists(ff, "key3.db"))
-check("firefox sessionstore-backups deleted",
-      not exists(ff, "sessionstore-backups"))
-check("firefox cache2 deleted", not exists(ff, "cache2"))
-check("firefox places -wal removed", not exists(ff, "places.sqlite-wal"))
-con = sqlite3.connect(os.path.join(ff, "places.sqlite"))
-bms = con.execute("SELECT COUNT(*) FROM moz_bookmarks").fetchone()[0]
-urls = [r[0] for r in con.execute("SELECT url FROM moz_places")]
-visits = con.execute("SELECT COUNT(*) FROM moz_historyvisits").fetchone()[0]
-ic = con.execute("PRAGMA integrity_check").fetchone()[0]
-con.close()
-check("firefox bookmarks kept", bms >= 1, str(bms))
-check("firefox bookmarked url kept", "https://keep.example" in urls, str(urls))
-check("firefox history url dropped", "https://drop.example" not in urls, str(urls))
-check("firefox visits cleared", visits == 0, str(visits))
-check("firefox places integrity ok", ic == "ok", ic)
+                  ("vivaldi", ".config/vivaldi"),
+                  ("opera", ".config/opera")]:
+    check(f"{name} profile root removed",
+          not os.path.exists(os.path.join(home, rel)),
+          os.path.join(home, rel))
+for b in M.BROWSERS:
+    for fid in b.get("flatpak_ids", ()):
+        froot = os.path.join(home, ".var", "app", fid)
+        if os.path.isdir(froot):
+            check(f"flatpak {fid} whole app dir removed",
+                  not os.path.exists(froot), froot)
+ffroot = os.path.join(home, ".mozilla", "firefox")
+check("firefox profile root removed", not os.path.exists(ffroot), ffroot)
+check("firefox places gone (full reset)",
+      not exists(home, ".mozilla/firefox/abc.default-release/places.sqlite"))
 
 print("\n== dry-run does not modify ==")
 home = fresh_home("dryrun")
@@ -343,12 +319,12 @@ home = fresh_home("inuse")
 build_all(home)
 orig_fiu = M._file_in_use
 
-M._file_in_use = lambda p: 4242 if os.path.basename(p) == "History" else None
+M._file_in_use = lambda p: 4242 if os.path.basename(p) == "google-chrome" else None
 try:
     res = M.wipe_private_data(apply=True, allow_running=True)
 finally:
     M._file_in_use = orig_fiu
-check("in-use: History kept",
+check("in-use: root kept",
       exists(home, ".config/google-chrome/Default/History"))
 check("in-use: reported skip", any("in use by pid 4242" in s
       for s in res["skipped"]), str(res["skipped"][:1]))

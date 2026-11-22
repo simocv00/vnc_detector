@@ -109,7 +109,7 @@ python3 vnc-watch.py watch --input-watch
 | `vnc-watch lockdown [--no-lock]` | close remote access and lock the screen |
 | `vnc-watch channels [--test] [--set K=V] [--clear K]` | configure remote alerts |
 | `vnc-watch shortcut [--remove] [--binding ...]` | install/remove the lockdown hotkey |
-| `vnc-watch clear` | confirm, then wipe browser + Discord data (panel menu) |
+| `vnc-watch clear` | confirm, then close browsers and full-reset their local data + Discord (panel menu) |
 | `vnc-watch lock` | lock the session (panel menu) |
 | `vnc-watch menu-window` | open the interactive menu in a terminal (panel menu) |
 | `vnc-watch tray [--tray-backend indicator\|floating]` | legacy GTK status dot (see below) |
@@ -289,59 +289,64 @@ Supported browsers — **stable native, Snap and Flatpak** installs:
 | Vivaldi | `~/.config/vivaldi` | — | `com.vivaldi.Vivaldi` |
 | Opera | `~/.config/opera` (or `Default/`) | — | `com.opera.Opera` |
 
-Every profile in a root is cleaned (`Default`, `Profile 1`, ...; Firefox
-profiles from `profiles.ini`; Opera's legacy root-level layout). Per profile
-the following are removed:
+A Clear is a **full profile reset**: each browser's whole data directory under
+your home is removed — every profile inside it (`Default`, `Profile 1`, ...;
+Firefox profiles from `profiles.ini`; Opera's legacy root-level layout) and
+every file a profile holds. That is what makes the next launch start fresh:
+**no history, no downloads, no cookies or logged-in sessions, no saved logins
+or autofill, no session-restore state and no account state** — and, by design,
+no bookmarks, extensions or settings either. Nothing inside a browser profile
+is preserved.
 
-- **Chromium-family** (Chromium, Chrome, Brave, Edge, Vivaldi, Opera):
-  `History`, `Visited Links`, `Web Data`, `Login Data`, `Login Data For
-  Account`, `Affiliation Database`, `Cookies`, `Network/Cookies`, `Sessions`,
-  `Current Session`, `Current Tabs`, `Last Session`, `Last Tabs`,
+- **Chromium-family** (Chromium, Chrome, Brave, Edge, Vivaldi, Opera): the
+  whole profile root (`~/.config/<browser>`) is removed. `Local State`,
+  `Preferences`/`Secure Preferences`, `History`, `Web Data`, `Login Data`,
+  `Cookies`/`Network/Cookies`, `Sessions`/`Current Session`/`Last Tabs`,
   `Session Storage`, `Local Storage`, `IndexedDB`, `Cache`, `Code Cache`,
-  `GPUCache`, `Service Worker`, `Shared Dictionary`, `Storage`, and the
-  network-state files — each database file is deleted **together with its
-  `-journal`/`-wal`/`-shm` sidecars**, so no rows survive in a WAL.
-- **Firefox**: `cookies.sqlite`, `formhistory.sqlite`, `logins.json`,
-  `logins-backup.json`, `key4.db`, `key3.db`, `signons.sqlite`,
-  `sessionstore-backups`, `sessionstore.jsonlz4`, `storage`, `cache2`,
-  `startupCache`, `shader-cache`, `crashes`.
-
-Firefox's `places.sqlite` is **not** deleted — it holds bookmarks as well as
-history. It is cleaned in place with SQL: history visits, typed-input history,
-and places not referenced by any bookmark are removed, while the bookmark tree
-and its annotations survive. `wal_checkpoint(TRUNCATE)` must succeed and the
-database is `VACUUM`ed with `secure_delete` on; `PRAGMA integrity_check` must
-return `ok`. On any unexpected failure the whole step is aborted and reported,
-and the WAL/SHM files are left in place.
-
-**Bookmarks are the only thing preserved.** Saved passwords, autofill, form
-history and NSS login data are removed. On Chromium-family browsers the
-`Bookmarks`/`Bookmarks.bak` files and `Preferences` are left untouched; a pass
-deletes credentials and history but keeps the bookmark file.
+  `GPUCache`, `Service Worker`, `Bookmarks` and the network-state files all go
+  together; whole-file database removal takes the `-journal`/`-wal`/`-shm`
+  sidecars with it.
+- **Firefox**: the whole profile root (`~/.mozilla/firefox` or the Snap/Flatpak
+  equivalent) is removed — `places.sqlite` (history *and* bookmarks),
+  `cookies.sqlite`, `formhistory.sqlite`, `logins.json`/`logins-backup.json`,
+  `key4.db`/`key3.db`, `prefs.js`, `signedInUser.json`, `sessionstore-backups`,
+  `storage`, `cache2`, `favicons.sqlite`, `permissions.sqlite`, `xulstore.json`
+  and the rest.
+- **Flatpak**: the whole `~/.var/app/<app-id>` directory is removed, so the
+  sandboxed `config/` profile **and** the app's `cache/` and `data/` go too. A
+  Flatpak browser is not left with any residue under its app directory.
 
 Per Discord (`discord`, `discordcanary`, `discordptb`, `BetterDiscord`):
 `Cache`, `Code Cache`, `GPUCache`, `Local Storage`, `Session Storage`,
 `IndexedDB`, `logs`, `Network Persistent State`, `Service Worker`.
 
-**Clear closes running browsers for you.** On an explicit Clear, every
-supported browser process owned by your UID is terminated automatically —
-SIGTERM first, then SIGKILL after a short grace period (`VW_BROWSER_TERM_GRACE`,
-default 8 s, then `VW_BROWSER_KILL_GRACE`, default 4 s) — because you chose
-Clear and accepted losing open tabs and unsaved work. No manual close is
-requested, and the SIGKILL needs no second confirmation. Only processes owned
-by your UID are ever signalled (the UID is re-checked immediately before each
-signal); other users' processes and unrelated applications are never touched.
-A process that cannot be killed is reported, and its data is left in place and
-reported as remaining — never claimed cleared. This is local-data cleanup only:
-it does not stop root-level screen monitoring, VNC viewing, screenshots, or
-remote access.
+**Clear shuts browsers down first, independent of discovery.** Finding a
+running browser and finding data to remove are two separate steps, so neither
+short-circuits the other. On an explicit Clear, every supported browser process
+owned by your UID is terminated automatically — SIGTERM first, then SIGKILL
+after a short grace period (`VW_BROWSER_TERM_GRACE`, default 8 s, then
+`VW_BROWSER_KILL_GRACE`, default 4 s) — then verified gone, and only then is the
+data discovered and removed. Because you chose Clear, losing open tabs and
+unsaved work is accepted and no manual close is requested.
+
+- **No data, browser running:** the browser is still closed and the result says
+  no browser/Discord data was found.
+- **Data, nothing running:** the data is removed as usual.
+- **Neither:** a clean no-op report.
+- **A survivor:** a process that cannot be killed is reported explicitly, and
+  **its data is left in place and listed as remaining — never claimed cleared
+  or archived**.
+
+Only processes owned by your UID are ever signalled (the UID is re-checked
+immediately before each signal); other users' processes and unrelated
+applications are never touched. This is local-data cleanup only: it does not
+stop root-level screen monitoring, VNC viewing, screenshots, or remote access.
 
 A category whose application is still running is skipped rather than deleted
-out from under it, and any individual file a same-user process holds open is
-skipped too; every removal is logged with its size, and every skip or failure
-is reported. Paths outside your home are refused and symlinks are never
-followed out of it. The same shutdown runs before Encrypt mode archives its
-data.
+out from under it, and any path a same-user process holds open is skipped too;
+every removal is logged with its size, and every skip or failure is reported.
+Paths outside your home are refused and symlinks are never followed out of it.
+The same shutdown-first flow runs before Encrypt mode archives its data.
 
 ### Encrypt instead of delete
 
@@ -385,11 +390,16 @@ Because encryption is a *recoverable* mode, it is not a privacy guarantee
 against someone who later obtains the passphrase, and the archive grows with
 the data you chose to keep.
 
-> **Known limits:** deleting `Login Data` removes the stored ciphertext, but
-> the OS-keyring master key (`Chrome Safe Storage`) and Firefox's NSS password
-> are left in place; synced passwords/history can return from a signed-in
-> account; and channel variants (Beta/Dev/Canary/Snapshot) are not covered.
-> Cookies and caches are removed as whole files, so affected sites log you out.
+> **Known limits:** a Clear is a *local* wipe. The OS-keyring entry
+> (`Chrome Safe Storage`) and Firefox's NSS password are left in place, and a
+> browser signed into a cloud **sync** account keeps its history/bookmarks on
+> the server — signing back in on any device can pull them down, so sign out of
+> sync on the other devices (or reset the account) for a full logout. Caches
+> outside the browser roots (`~/.cache/<browser>`) and any custom
+> `--user-data-dir` are not covered, and channel variants
+> (Beta/Dev/Canary/Snapshot) are not in the root table. `unlink` is not secure
+> erase: on SSD/CoW filesystems deleted bytes may remain forensically
+> recoverable. Cleared sites log you out because their cookies are gone.
 
 ---
 
@@ -761,8 +771,12 @@ code; if you see it again, your proxy or a newer block is involved. Test with
 
 **Wiped data came back**
 
-A running browser can re-flush databases from memory. Close browsers before
-relying on a wipe.
+A running browser can re-flush databases from memory, so Clear closes supported
+browsers first and verifies they are gone before deleting. If a process survives
+(a survivor is reported) its data is deliberately left in place, so nothing is
+cleaned out from under it. Separately, a browser signed into cloud **sync** can
+re-pull history/bookmarks from the server after you sign back in — that copy is
+not local and cannot be revoked from this machine.
 
 **Top-panel indicator missing after install**
 

@@ -1771,11 +1771,46 @@ def browser_config_ok():
     return problems
 
 
+def _browser_data_roots(b):
+    """Existing whole directories that hold this browser's local data.
+
+    A browser is cleared by removing its data directories, not selected files:
+    that is what guarantees no history, logged-in account, or session-restore
+    state survives. Native and Snap use the profile root; a Flatpak browser
+    gets its whole `~/.var/app/<id>` directory, so its `cache/` and `data/`
+    go too and the narrower `config/...` path is then redundant.
+    """
+    found = []
+
+    def push(rel):
+        p = os.path.expanduser(rel)
+        if os.path.lexists(p) and p not in found:
+            found.append(p)
+
+    for fid in b.get("flatpak_ids", ()):
+        push(f"~/.var/app/{fid}")
+    for _label, rel in b["roots"]:
+        p = os.path.expanduser(rel)
+        if any(p == q or p.startswith(q + os.sep) for q in found):
+            continue                      # already covered by ~/.var/app/<id>
+        push(rel)
+    return found
+
+
+def _browser_root_label(b, path):
+    if "/.var/app/" in path:
+        return f"{b['name']} (flatpak)"
+    if "/snap/" in path:
+        return f"{b['name']} (snap)"
+    return f"{b['name']} (native)"
+
+
 def wipe_targets():
     """[(label, path, kind)] of existing browser and Discord data to clean.
 
-    kind is "remove" (delete the file/dir) or "places" (SQL-clean a Firefox
-    places.sqlite, preserving bookmarks)."""
+    Browser data is targeted as whole directories — native, Snap and Flatpak —
+    so a Clear leaves no profile behind: no history, no logged-in account, no
+    session-restore state. kind is "remove" (whole-file/whole-dir removal)."""
     targets = []
     seen = set()
 
@@ -1785,19 +1820,8 @@ def wipe_targets():
             targets.append((label, path, kind))
 
     for b in BROWSERS:
-        family = b["family"]
-        items = (FIREFOX_WIPE_ITEMS if family == "firefox"
-                 else CHROMIUM_WIPE_ITEMS)
-        for label, rel in b["roots"]:
-            root = os.path.expanduser(rel)
-            if not os.path.isdir(root):
-                continue
-            for prof in discover_profiles(root, family):
-                base = f"{label}/{os.path.basename(prof)}"
-                for item in items:
-                    add(base, os.path.join(prof, item))
-                if family == "firefox":
-                    add(base, os.path.join(prof, FIREFOX_PLACES), "places")
+        for root in _browser_data_roots(b):
+            add(_browser_root_label(b, root), root)
     for rel in DISCORD_ROOTS:
         root = os.path.expanduser(rel)
         if not os.path.isdir(root):
@@ -1805,6 +1829,21 @@ def wipe_targets():
         for item in DISCORD_ITEMS:
             add(f"discord/{os.path.basename(root)}", os.path.join(root, item))
     return targets
+
+
+def _clear_survey():
+    """Independent Clear discovery: (targets, running_browsers, total_bytes).
+
+    Browser shutdown is never coupled to whether profile data was found."""
+    targets = wipe_targets()
+    browsers = running_browsers()
+    total = sum(_size_of(p) for _l, p, _k in targets)
+    return targets, browsers, total
+
+
+def _clear_has_work(targets, browsers):
+    """Clear proceeds if there is data to remove OR a browser to close."""
+    return bool(targets) or bool(browsers)
 
 
 def wipe_private_data(apply=True, allow_running=False, encrypt=False,
@@ -4663,16 +4702,22 @@ def menu_clear():
         print(f"clear refused: {why} (exam/lock window active)\n")
         log_alert(f"menu action=clear outcome=refused:{why}")
         return
-    items = wipe_targets()
-    if not items:
-        print("nothing to clear (no browser or Discord data found)\n")
+    targets, browsers, total = _clear_survey()
+    if not _clear_has_work(targets, browsers):
+        print("nothing to clear (no supported browser/Discord data and no "
+              "supported browser running)\n")
         return
-    total = sum(_size_of(p) for _l, p, _k in items)
-    prompt = (f"Close browsers and delete their local data? {len(items)} "
-              f"item(s), about {total / 1048576:.1f} MB — history, cookies, "
-              f"sessions, caches, autofill and saved logins. Running browsers "
-              f"are closed automatically (SIGTERM, then SIGKILL); open tabs "
-              f"and unsaved work are lost. Cannot be undone.")
+    if targets:
+        lead = (f"Close browsers and delete their local data? {len(targets)} "
+                 f"item(s), about {total / 1048576:.1f} MB — full profile "
+                 f"reset: history, cookies, sessions, caches, autofill, saved "
+                 f"logins, bookmarks and settings.")
+    else:
+        lead = (f"No local browser/Discord data found, but {len(browsers)} "
+                f"supported browser process(es) are running.")
+    prompt = (lead + " Running browsers are closed automatically (SIGTERM, "
+              "then SIGKILL); open tabs and unsaved work are lost. Next "
+              "launch starts from a fresh profile. Cannot be undone.")
     if not confirm(prompt):
         print("cancelled\n")
         log_alert("menu action=clear outcome=cancelled")
@@ -4951,23 +4996,32 @@ def _tray_confirm_wipe(parent=None):
     """Destructive confirm. Returns (decision, quit_first, encrypt, passphrase)
     where decision is True (proceed), False (cancel), or None (nothing to do)."""
     from gi.repository import Gtk
-    items = wipe_targets()
-    if not items:
+    targets, browsers, total = _clear_survey()
+    if not _clear_has_work(targets, browsers):
         return None, False, False, None
-    total = sum(_size_of(p) for _l, p, _k in items)
     dlg = Gtk.MessageDialog(transient_for=parent, modal=True,
                             message_type=Gtk.MessageType.WARNING,
                             buttons=Gtk.ButtonsType.NONE)
     dlg.set_title("Clear browser + Discord data")
     dlg.set_markup("<b>Close browsers and clear local data?</b>")
-    dlg.format_secondary_text(
-        f"{len(items)} item(s), about {total / 1048576:.1f} MB — history, "
-        f"downloads, cookies, sessions, caches, autofill, and saved logins "
-        f"across Firefox, Chrome, Chromium, Brave, Edge, Vivaldi and Opera, "
-        f"plus Discord storage. Open tabs and unsaved work will be lost: "
-        f"running browsers are closed automatically (SIGTERM, then SIGKILL). "
-        f"Deleting cannot be undone; the encrypted option keeps a restorable "
-        f"archive instead. This does not affect screen monitoring or VNC.")
+    if targets:
+        detail = (
+            f"{len(targets)} item(s), about {total / 1048576:.1f} MB — full "
+            f"profile reset across Firefox, Chrome, Chromium, Brave, Edge, "
+            f"Vivaldi and Opera (native, Snap and Flatpak): history, "
+            f"downloads, cookies, sessions, caches, autofill, saved logins, "
+            f"bookmarks and settings, plus Discord storage. ")
+    else:
+        detail = (
+            "No local browser/Discord data was found, but supported browser "
+            "processes are running and will be closed. ")
+    detail += (
+        "Running browsers are closed automatically (SIGTERM, then SIGKILL); "
+        "open tabs and unsaved work are lost. Next launch starts from a fresh "
+        "profile: no history, no logged-in account, no restored windows. "
+        "Deleting cannot be undone; the encrypted option keeps a restorable "
+        "archive instead. This does not affect screen monitoring or VNC.")
+    dlg.format_secondary_text(detail)
     dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
     dlg.add_button("Proceed", Gtk.ResponseType.OK)
     dlg.set_default_response(Gtk.ResponseType.CANCEL)
@@ -5008,8 +5062,11 @@ def _wipe_and_summary(quit_first=True, encrypt=False, passphrase=None):
     q = quit_browsers()
     res = wipe_private_data(apply=True, encrypt=encrypt, passphrase=passphrase)
     verb = "Archived" if encrypt else "Cleared"
-    parts = [f"{verb} {len(res['items'])} item(s), "
-             f"{res['total'] / 1048576:.1f} MB"]
+    if res["items"]:
+        parts = [f"{verb} {len(res['items'])} item(s), "
+                 f"{res['total'] / 1048576:.1f} MB"]
+    else:
+        parts = ["no supported browser/Discord data found"]
     if res["vault"]:
         parts.append(f"vault {os.path.basename(res['vault'])} "
                      f"(restore with clear --restore)")
@@ -5059,12 +5116,17 @@ def _vault_list_command():
 
 def _confirm_wipe_cli(encrypt=False):
     """Fallback confirmation when GTK is unavailable (SSH / no display)."""
-    items = wipe_targets()
-    if not items:
+    targets, browsers, total = _clear_survey()
+    if not _clear_has_work(targets, browsers):
         return None, False, False, None
-    total = sum(_size_of(p) for _l, p, _k in items)
     mode = "encrypt" if encrypt else "delete"
-    print(f"{len(items)} item(s), about {total / 1048576:.1f} MB")
+    if targets:
+        print(f"{len(targets)} item(s), about {total / 1048576:.1f} MB — "
+              "full browser profile reset (history, cookies, logins, sessions, "
+              "bookmarks, settings) plus Discord storage")
+    else:
+        print("no local browser/Discord data found; "
+              f"{len(browsers)} running browser process(es) will be closed")
     print("running browsers will be closed (SIGTERM, then SIGKILL); open "
           "tabs and unsaved work are lost")
     print(f"mode: {mode}"
@@ -5125,7 +5187,8 @@ def clear_command(encrypt=False, restore=None, list_vault=False):
         # No display / GTK: confirm on the terminal instead of crashing.
         ok, quit_first, encrypt, passphrase = _confirm_wipe_cli(encrypt)
     if ok is None:
-        msg = "nothing to clear (no browser or Discord data found)"
+        msg = ("nothing to clear (no supported browser/Discord data and no "
+               "supported browser running)")
         notify("vnc-watch", msg, "viewer", urgent=False)
         print(msg, flush=True)
         return 0
@@ -5157,8 +5220,9 @@ def _tray_clear():
     ok, quit_first, encrypt, passphrase = _confirm_parts(
         _tray_confirm_wipe())
     if ok is None:
-        notify("vnc-watch", "nothing to clear (no browser or Discord data found)",
-               "viewer", urgent=False)
+        notify("vnc-watch",
+               "nothing to clear (no supported browser/Discord data and no "
+               "supported browser running)", "viewer", urgent=False)
         return
     if ok:
         _tray_do_wipe(quit_first, encrypt, passphrase)
