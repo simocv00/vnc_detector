@@ -3014,6 +3014,22 @@ SECRET_FLAGS = ("password", "passwd", "pass", "token", "secret", "api-key",
                 "apikey", "auth", "private-key", "passphrase", "pin",
                 "client-secret", "access-token", "refresh-token")
 SCRIPT_FLAGS = {"-c", "--command", "--eval"}
+# Privilege-escalation helpers. A user-owned process whose effective uid differs
+# from the session uid is escalation; a root process under a non-root session is
+# root command execution. The privileged pre-auth sshd runs as root by design and
+# is a service anchor, not escalation.
+ESCALATORS = {"sudo", "su", "doas", "pkexec", "runuser"}
+SERVICE_ANCHORS = {"sshd", "sshd-session"}
+# systemctl verbs: read-only inspection vs state change. Anything else is left
+# "unknown" rather than guessed at.
+SERVICE_VERBS_INSPECT = {"show", "status", "cat", "is-active", "is-enabled",
+                         "is-failed", "list-units", "list-unit-files",
+                         "list-sockets", "list-timers", "list-dependencies",
+                         "get-default", "show-environment", "help"}
+SERVICE_VERBS_CHANGE = {"start", "stop", "restart", "reload", "reload-or-restart",
+                        "try-restart", "enable", "disable", "mask", "unmask",
+                        "preset", "set-default", "set-property", "edit",
+                        "daemon-reload", "daemon-reexec", "kill", "reset-failed"}
 
 _ssh_wh_last = {}
 _ssh_wh_times = collections.deque()
@@ -3193,6 +3209,32 @@ def _stat_fields(pid):
         return None
 
 
+def _as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _proc_ids(pid):
+    """(real, effective, saved, fs) uids from /proc/<pid>/status, or None.
+
+    The Uid line is world-readable, so another user's effective uid is still
+    attributable. A vanished process or a denied read returns None — unknown,
+    and never treated as root."""
+    raw = _read(os.path.join(PROC_ROOT, pid, "status"))
+    if not raw:
+        return None
+    for line in raw.splitlines():
+        if line.startswith("Uid:"):
+            f = line.split()
+            try:
+                return tuple(int(x) for x in f[1:5])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
 def _session_scope(pid):
     cg = _read(os.path.join(PROC_ROOT, pid, "cgroup")) or ""
     m = re.search(r"/session-([0-9A-Za-z]+)\.scope", cg)
@@ -3257,41 +3299,186 @@ def _safe_cmdline(pid):
     return _redact_argv(parts) if parts else None
 
 
-def ssh_processes(loginctl_sid):
-    """Processes whose cgroup is this logind session, or None.
+def _proc_argv(pid):
+    """argv for classification ONLY. Never stored, logged, or transmitted.
 
-    Identity is loginctl_sid:pid:start_ticks so a repeated poll is stable while
-    a later run of the same executable is still a new event. /proc is a
-    point-in-time snapshot, never a command history.
+    Read unprivileged, consumed by the classifiers below, and discarded. They
+    return a fixed enum (an action word or an automation class), so raw
+    arguments — and any secret inside them — cannot reach an event, the state
+    file, the audit log, or a webhook payload."""
+    raw = _read(os.path.join(PROC_ROOT, pid, "cmdline"), binary=True)
+    if not raw:
+        return []
+    return [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+
+
+def _systemctl_verb(argv):
+    """The first bare token after 'systemctl' (its subcommand), or None."""
+    for a in argv[1:]:
+        if a.startswith("-"):
+            continue
+        return a
+    return None
+
+
+def _command_action(exe, argv):
+    """Classify a process as inspect / configure / execute / unknown.
+
+    Returns only a fixed action word derived from argv; argv itself is never
+    returned or recorded."""
+    if exe == "systemctl" and argv:
+        v = _systemctl_verb(argv)
+        if v in SERVICE_VERBS_INSPECT:
+            return "inspect"
+        if v in SERVICE_VERBS_CHANGE:
+            return "configure"
+        return "unknown"
+    if exe in VNC_SERVER_COMMS:
+        return "execute"
+    # A server name inside a wrapped shell body (`sh -c '... x11vnc ...'`) is
+    # still server execution; tokenize each argv element to see it.
+    for a in argv:
+        for tok in a.replace("\t", " ").split():
+            if os.path.basename(tok) in VNC_SERVER_COMMS:
+                return "execute"
+    return "unknown"
+
+
+def _automation_flavor(exe, argv):
+    """Non-accusatory automation class for one process.
+
+    'automation' for a known transport/automation binary.
+    'ansible-become-compatible' when a privilege escalator is invoked with the
+    non-interactive become shape (stdin password + non-interactive, i.e.
+    `sudo -n -S ...`), the pattern Ansible's become plugin produces. This is a
+    recognition, not a verdict — severity stays informational.
+    'interactive' otherwise."""
+    if exe in AUTOMATED_EXES:
+        return "automation"
+    if exe in ESCALATORS and argv:
+        has_stdin = "-S" in argv or "--stdin" in argv
+        non_interactive = "-n" in argv or "--non-interactive" in argv
+        if has_stdin and non_interactive:
+            return "ansible-become-compatible"
+    return "interactive"
+
+
+def ssh_processes(loginctl_sid, session_uid=None, session_account=None):
+    """Processes in this logind session's cgroup, correlated and enriched.
+
+    Identity stays loginctl_sid:pid:start_ticks, so a repeated poll is stable
+    while a later run of the same executable is a new event. Adds real/effective
+    uid, escalation against the session uid, the parent link within the session,
+    and per-process automation/action classes. /proc is a point-in-time
+    snapshot, never a command history; a vanished, recycled or unreadable
+    process is skipped or left unknown rather than guessed at.
     """
     try:
         pids = [p for p in os.listdir(PROC_ROOT) if p.isdigit()]
     except OSError:
         return None
-    out = []
     want = str(loginctl_sid)
+    sid_int = _as_int(session_uid)
+    raw = []
     for pid in pids:
         if _session_scope(pid) != want:
             continue
         st = _stat_fields(pid)
         if not st:
             continue
-        exe = _exe_name(pid)
+        raw.append((pid, st, _exe_name(pid), _proc_ids(pid)))
+
+    by_pid = {pid: (st, exe) for pid, st, exe, _ids in raw}
+    out = []
+    for pid, st, exe, ids in raw:
+        # Re-read the start time: a pid recycled between listing and reading is
+        # a different process and is dropped, never merged into this one.
+        st2 = _stat_fields(pid)
+        if not st2 or st2["start_ticks"] != st["start_ticks"]:
+            continue
+        uid, euid = (ids[0], ids[1]) if ids else (None, None)
+        chain, seen, cur = [], set(), st["ppid"]
+        while cur and cur not in seen:
+            seen.add(cur)
+            nxt = by_pid.get(str(cur))
+            if nxt is None:
+                break
+            chain.append(nxt[1])
+            cur = nxt[0]["ppid"]
+        escalators = []
+        for e in [exe] + chain:
+            if e in ESCALATORS and e not in escalators:
+                escalators.append(e)
+        escalated = (uid is not None and euid is not None and sid_int is not None
+                     and uid == sid_int and euid != sid_int)
+        root = (euid == 0 and sid_int not in (0, None)
+                and exe not in SERVICE_ANCHORS)
+        argv = _proc_argv(pid)
         out.append({
             "kind": "ssh-command",
             "key": f"{want}:{pid}:{st['start_ticks']}",
             "identity": f"{want}:{pid}:{st['start_ticks']}",
             "loginctl_sid": want,
+            "account": session_account,
             "pid": int(pid),
             "ppid": st["ppid"],
             "process_sid": st["process_sid"],
             "start_ticks": st["start_ticks"],
             "exe": exe,
-            "automation": "automated" if exe in AUTOMATED_EXES else "unknown",
+            "uid": uid,
+            "euid": euid,
+            "parent_exe": chain[0] if chain else None,
+            "depth": len(chain),
+            "escalated": bool(escalated),
+            "root": bool(root),
+            "escalators": escalators,
+            "automation": _automation_flavor(exe, argv),
+            "action": _command_action(exe, argv),
             "cmd_redacted": _safe_cmdline(pid),
             "evidence": "OBSERVED",
         })
     return out
+
+
+def ssh_activity(session, procs):
+    """One grouped event for a session's correlated process activity.
+
+    Metadata only: derived classes and executable names, never argv. This is the
+    single structured alert for a session; the per-process ssh-command events
+    stay in the local audit log."""
+    sid = session.get("loginctl_sid")
+    procs = list(procs or [])
+    escalated = any(p.get("escalated") for p in procs)
+    root_exec = any(p.get("root") for p in procs)
+    actions = sorted({p.get("action") for p in procs
+                      if p.get("action") and p.get("action") != "unknown"})
+    flav = "interactive"
+    if any(p.get("automation") == "ansible-become-compatible" for p in procs):
+        flav = "ansible-become-compatible"
+    elif any(p.get("automation") == "automation" for p in procs):
+        flav = "automation"
+    labels = []
+    for p in procs:
+        lbl = f"{p.get('exe')}:{p.get('action')}"
+        if p.get("escalated"):
+            lbl += ":escalated"
+        if p.get("root"):
+            lbl += ":root"
+        labels.append(lbl)
+    return {
+        "kind": "ssh-session-activity",
+        "key": f"sessact:{sid}:" + ":".join(sorted(
+            p.get("identity", "") for p in procs)),
+        "loginctl_sid": sid,
+        "leader_pid": session.get("leader_pid"),
+        "escalated": bool(escalated),
+        "root_exec": bool(root_exec),
+        "automation": flav,
+        "actions": actions,
+        "process_count": len(procs),
+        "proc_labels": labels,
+        "evidence": "OBSERVED",
+    }
 
 
 def wtmp_new_records(state):
@@ -3378,8 +3565,16 @@ def ssh_severity(ev):
         return "info"
     if k == "ssh-connection":
         return "warning"
+    if k == "ssh-session-activity":
+        if ev.get("escalated") or ev.get("root_exec"):
+            return "warning"
+        if set(ev.get("actions") or ()) & {"configure", "execute"}:
+            return "warning"
+        return "info"
     if k == "ssh-command":
-        return "info" if ev.get("automation") == "automated" else "warning"
+        a = ev.get("automation")
+        return "info" if a in ("automated", "automation",
+                               "ansible-become-compatible") else "warning"
     return "info"
 
 
@@ -3397,9 +3592,28 @@ def _ssh_audit_line(ev):
     who = f"{ev.get('account') or 'unknown'} from {ev.get('remote_host') or ev.get('peer') or '?'}"
     extra = ""
     if k == "ssh-command":
-        extra = f" exe={ev.get('exe')} pid={ev.get('pid')} start={ev.get('start_ticks')}"
+        extra = (f" exe={ev.get('exe')} pid={ev.get('pid')} "
+                 f"start={ev.get('start_ticks')} action={ev.get('action')}")
+        if ev.get("escalated"):
+            extra += " escalated"
+        if ev.get("root"):
+            extra += " root"
         if ev.get("cmd_redacted"):
             extra += " cmd=" + " ".join(ev["cmd_redacted"])[:200]
+    elif k == "ssh-session-activity":
+        bits = []
+        if ev.get("escalated"):
+            bits.append("privilege-escalation")
+        if ev.get("root_exec"):
+            bits.append("root-execution")
+        if ev.get("automation") and ev.get("automation") != "interactive":
+            bits.append(ev["automation"])
+        if ev.get("actions"):
+            bits.append("actions=" + ",".join(ev["actions"]))
+        procs = " ".join(ev.get("proc_labels") or [])
+        extra = " (" + ", ".join(bits) + ")" if bits else ""
+        if procs:
+            extra += " [" + procs[:200] + "]"
     return f"{k}: {who}{extra} [evidence {ev.get('evidence')}]"
 
 
@@ -3429,7 +3643,14 @@ def ssh_remote_message(ev):
             lines += [f"executable: {ev.get('exe')}",
                       f"process: pid {ev.get('pid')} ppid {ev.get('ppid')} "
                       f"start_ticks {ev.get('start_ticks')}",
+                      f"action: {ev.get('action')}",
                       f"automation: {ev.get('automation')}"]
+        elif k == "ssh-session-activity":
+            lines += [f"escalation: {'yes' if ev.get('escalated') else 'no'}",
+                      f"root execution: {'yes' if ev.get('root_exec') else 'no'}",
+                      f"automation: {ev.get('automation')}",
+                      f"actions: {', '.join(ev.get('actions') or []) or 'none'}",
+                      f"processes: {ev.get('process_count')}"]
         title = "vnc-watch: SSH " + k.split("-", 1)[1].upper()
     lines.append("note: metadata only; does not identify the operator")
     lines.append(f"time: {datetime.now():%Y-%m-%d %H:%M:%S %Z}")
@@ -3438,27 +3659,37 @@ def ssh_remote_message(ev):
 
 def _ssh_should_webhook(ev):
     k = ev.get("kind")
-    if k not in ("ssh-session", "ssh-connection", "ssh-command", "ssh-x11vnc"):
+    if k not in ("ssh-session", "ssh-connection", "ssh-command",
+                 "ssh-session-activity", "ssh-x11vnc"):
         return False
     # Only bocal (or an unattributed connection/service observation) leaves the
     # machine. Another account's activity stays local unless explicitly allowed.
     return ev.get("account") in (None, "bocal")
 
 
-def ssh_emit(ev, notify_local=True):
-    """Audit always; local notify + webhook are best-effort and independent."""
+def ssh_emit(ev, notify_local=True, webhook=True):
+    """Audit always; local notify + webhook are best-effort and independent.
+
+    Per-process ssh-command events are logged only (webhook=False): the grouped
+    ssh-session-activity event is the single structured alert that leaves the
+    machine. An outbound client connection to a remote SSH port is local-audit
+    only by policy — ordinary `git`/`scp` over SSH is not a security event."""
     log_alert(_ssh_audit_line(ev))
-    if notify_local and ev.get("kind") in ("ssh-session", "ssh-connection",
-                                           "ssh-x11vnc", "outbound"):
-        notify("SSH watch", _ssh_audit_line(ev), ev["kind"],
-               ssh_severity(ev) in ("warning", "critical"))
-    if not _ssh_should_webhook(ev):
-        return
     k = ev.get("kind")
+    quiet = (k == "outbound" and _as_int(ev.get("rport")) == SSH_PORT)
+    if notify_local and not quiet and k in ("ssh-session", "ssh-connection",
+                                            "ssh-x11vnc", "outbound",
+                                            "ssh-session-activity"):
+        notify("SSH watch", _ssh_audit_line(ev), k,
+               ssh_severity(ev) in ("warning", "critical"))
+    if not webhook or quiet or not _ssh_should_webhook(ev):
+        return
     if k == "ssh-command":
         key = f"cmd:{ev.get('account')}:{ev.get('exe')}"
     elif k == "ssh-session":
         key = f"sess:{ev.get('loginctl_sid')}"
+    elif k == "ssh-session-activity":
+        key = f"act:{ev.get('loginctl_sid')}"
     elif k == "ssh-connection":
         key = f"conn:{ev.get('peer')}:{ev.get('peer_port')}"
     else:
@@ -3510,10 +3741,20 @@ def ssh_audit_section():
             print(f"  session {s['loginctl_sid']}: {s['account']} "
                   f"from {s['remote_host'] or '?'} "
                   f"({s['service']}, {s['line'] or '-'})")
-            procs = ssh_processes(s["loginctl_sid"]) or []
+            procs = ssh_processes(s["loginctl_sid"], s.get("uid"),
+                                  s.get("account")) or []
             for p in procs:
+                marks = []
+                if p["uid"] is not None:
+                    marks.append(f"uid {p['uid']}/euid {p['euid']}")
+                if p["escalated"]:
+                    marks.append("escalated")
+                if p["root"]:
+                    marks.append("root")
                 print(f"    proc {p['pid']} {p['exe']} "
-                      f"({p['automation']}, start {p['start_ticks']})")
+                      f"({p['action']}/{p['automation']}"
+                      + (", " + ", ".join(marks) if marks else "")
+                      + f", start {p['start_ticks']})")
     conns = ssh_established()
     if conns is None:
         print("  connections: unavailable (ss)")
@@ -3752,7 +3993,8 @@ def follow_live(args):
         log_alert(f"ssh pre-existing: {s['account']} from "
                   f"{s['remote_host'] or '?'} (session {s['loginctl_sid']}, "
                   f"{s['service']}) - surfaced, not alerted")
-        for p in (ssh_processes(s["loginctl_sid"]) or []):
+        for p in (ssh_processes(s["loginctl_sid"], s.get("uid"),
+                                s.get("account")) or []):
             ssh_seen.add(p["identity"])
     for peer, rport, lport in (ssh_state["connections"] or []):
         ssh_seen.add(f"conn:{peer}:{rport}:{lport}")
@@ -3974,15 +4216,24 @@ def follow_live(args):
                             ssh_seen.add(s["key"])
                             ssh_emit(dict(s))
                         for s in sess_now:
-                            for p in (ssh_processes(s["loginctl_sid"]) or []):
-                                if p["identity"] in ssh_seen:
-                                    continue
+                            fresh = [p for p in (ssh_processes(
+                                s["loginctl_sid"], s.get("uid"),
+                                s.get("account")) or [])
+                                if p["identity"] not in ssh_seen]
+                            for p in fresh:
                                 ssh_seen.add(p["identity"])
-                                ssh_emit(dict(p, account=s["account"],
+                                # per-process detail: local audit log only
+                                ssh_emit(dict(p, remote_host=s["remote_host"],
+                                              service=s["service"],
+                                              line=s.get("line")),
+                                         notify_local=False, webhook=False)
+                            if fresh:
+                                act = ssh_activity(s, fresh)
+                                ssh_emit(dict(act, account=s["account"],
                                               uid=s["uid"],
                                               remote_host=s["remote_host"],
-                                              service=s["service"]),
-                                         notify_local=False)
+                                              service=s["service"],
+                                              line=s.get("line")))
                     known_peers = {s["remote_host"] for s in (sess_now or [])
                                    if s["remote_host"]}
                     if snap["connections"] is not None:

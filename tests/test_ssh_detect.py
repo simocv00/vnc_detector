@@ -8,6 +8,7 @@ files, and monkeypatched loginctl/ss/webhook. No live campus SSH session, real
     python3 tests/test_ssh_detect.py
 """
 import importlib.util
+import json
 import os
 import shutil
 import struct
@@ -43,7 +44,8 @@ PROC = os.path.join(SANDBOX, "proc")
 os.makedirs(PROC, exist_ok=True)
 
 
-def make_proc(pid, ppid, session_sid, start, scope, exe="sh", cmdline=None):
+def make_proc(pid, ppid, session_sid, start, scope, exe="sh", cmdline=None,
+              uid=1000, euid=None, write_status=True):
     d = os.path.join(PROC, str(pid))
     os.makedirs(d, exist_ok=True)
     # fields 4..22 after the (comm) field: ppid pgrp session tty tpgid flags
@@ -56,6 +58,11 @@ def make_proc(pid, ppid, session_sid, start, scope, exe="sh", cmdline=None):
           if scope else "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n")
     open(os.path.join(d, "cgroup"), "w").write(cg)
     open(os.path.join(d, "comm"), "w").write(f"{exe}\n")
+    if write_status:
+        if euid is None:
+            euid = uid
+        open(os.path.join(d, "status"), "w").write(
+            f"Name:\t{exe}\nUid:\t{uid}\t{euid}\t{uid}\t{uid}\nGid:\t1\t1\t1\t1\n")
     if cmdline is not None:
         open(os.path.join(d, "cmdline"), "wb").write(
             b"\0".join(x.encode() for x in cmdline) + b"\0")
@@ -345,6 +352,197 @@ M.SSH_OUTBOUND = False
 M.subprocess.run = _orig_run
 check("outbound disabled returns empty", M.outbound_peers() == [])
 M.SSH_OUTBOUND = True
+
+# ------------------------------------------------- SSH Phase 3: correlation
+print("\n== correlation / escalation / root ==")
+# Live shape: one SSH session (uid 1000) escalates to root via sudo and runs a
+# service inspection; the pre-auth sshd is root by design and is not escalation.
+make_proc(5000, 900, 5000, 111, "200", exe="sshd", uid=0, euid=0)
+make_proc(5001, 5000, 5000, 112, "200", exe="sshd", uid=1000, euid=1000)
+make_proc(5002, 5001, 5000, 113, "200", exe="sudo", uid=1000, euid=0,
+          cmdline=["sudo", "-H", "-S", "-n", "-u", "root", "/bin/sh", "-c",
+                   "BECOME-SUCCESS-abc; systemctl show x11vnc.service"])
+make_proc(5003, 5002, 5000, 114, "200", exe="sh", uid=0, euid=0,
+          cmdline=["/bin/sh", "-c", "systemctl show x11vnc.service"])
+make_proc(5004, 5003, 5000, 115, "200", exe="systemctl", uid=0, euid=0,
+          cmdline=["systemctl", "show", "x11vnc.service"])
+make_proc(5005, 5003, 5000, 116, "200", exe="systemctl", uid=0, euid=0,
+          cmdline=["systemctl", "start", "x11vnc.service"])
+make_proc(5006, 5003, 5000, 117, "200", exe="x11vnc", uid=0, euid=0)
+
+procs = M.ssh_processes("200", "1000", "bocal")
+by = {p["pid"]: p for p in procs}
+check("all session procs correlated",
+      set(by) == {5000, 5001, 5002, 5003, 5004, 5005, 5006}, str(sorted(by)))
+check("sudo escalation detected", by[5002]["escalated"] is True, str(by[5002]))
+check("sudo run as root flagged", by[5002]["root"] is True)
+check("pre-auth root sshd not escalation/root",
+      by[5000]["escalated"] is False and by[5000]["root"] is False, str(by[5000]))
+check("session anchor not escalation/root",
+      by[5001]["escalated"] is False and by[5001]["root"] is False)
+check("escalator named on ancestor chain",
+      "sudo" in by[5002]["escalators"], str(by[5002]["escalators"]))
+check("parent_exe resolves within the session",
+      by[5004]["parent_exe"] == "sh", str(by[5004]["parent_exe"]))
+check("depth counts the ancestor chain", by[5004]["depth"] >= 3,
+      str(by[5004]["depth"]))
+check("uid/euid captured",
+      (by[5002]["uid"], by[5002]["euid"]) == (1000, 0), str(by[5002]))
+
+print("\n== automation recognition (non-accusatory) ==")
+check("become shape recognised",
+      by[5002]["automation"] == "ansible-become-compatible", by[5002]["automation"])
+check("become severity stays info",
+      M.ssh_severity({"kind": "ssh-command",
+                      "automation": "ansible-become-compatible"}) == "info")
+check("sudo without -n is interactive",
+      M._automation_flavor("sudo", ["sudo", "-S", "-u", "root"]) == "interactive")
+check("known transport is automation",
+      M._automation_flavor("scp", ["scp", "a", "b"]) == "automation")
+
+print("\n== inspection / configuration / execution ==")
+check("systemctl show -> inspect", by[5004]["action"] == "inspect", by[5004]["action"])
+check("systemctl start -> configure", by[5005]["action"] == "configure", by[5005]["action"])
+check("x11vnc process -> execute", by[5006]["action"] == "execute", by[5006]["action"])
+check("unknown verb -> unknown",
+      M._command_action("systemctl", ["systemctl", "frobnicate", "x"]) == "unknown")
+check("x11vnc wrapped in argv -> execute",
+      M._command_action("sh", ["/bin/sh", "-c", "x11vnc -display :0"]) == "execute")
+
+print("\n== grouping: one structured alert per session ==")
+act = M.ssh_activity({"loginctl_sid": "200", "leader_pid": 5001}, procs)
+check("grouped kind", act["kind"] == "ssh-session-activity")
+check("grouped counts every process", act["process_count"] == len(procs))
+check("grouped shows escalation", act["escalated"] is True)
+check("grouped shows root execution", act["root_exec"] is True)
+check("grouped automation", act["automation"] == "ansible-become-compatible",
+      act["automation"])
+check("grouped actions deduped/sorted",
+      act["actions"] == ["configure", "execute", "inspect"], str(act["actions"]))
+check("grouped escalation -> warning",
+      M.ssh_severity(act) == "warning")
+check("grouped is webhooked", M._ssh_should_webhook(dict(act, account="bocal")))
+check("inspect-only grouped -> info",
+      M.ssh_severity({"kind": "ssh-session-activity", "actions": ["inspect"]}) == "info")
+check("configure grouped -> warning",
+      M.ssh_severity({"kind": "ssh-session-activity",
+                      "actions": ["configure"]}) == "warning")
+
+print("\n== grouped replaces per-process webhook ==")
+sent = []
+M.remote_alert = lambda t, x: (sent.append((t, x)) or True)
+logs = []
+M.log_alert = lambda m: logs.append(m)
+notified = []
+M.notify = lambda *a, **k: notified.append(a)
+M.SSH_WEBHOOK_COOLDOWN = 0.0
+M.SSH_WEBHOOK_MAX = 1000
+M._ssh_wh_times.clear()
+M._ssh_wh_last.clear()
+seen = set()
+
+
+def _scan_round():
+    fresh = [p for p in M.ssh_processes("200", "1000", "bocal")
+             if p["identity"] not in seen]
+    for p in fresh:
+        seen.add(p["identity"])
+        M.ssh_emit(dict(p, account="bocal"), notify_local=False, webhook=False)
+    if fresh:
+        M.ssh_emit(dict(M.ssh_activity({"loginctl_sid": "200",
+                                        "leader_pid": 5001}, fresh),
+                        account="bocal"))
+    return len(fresh)
+
+
+n1 = _scan_round()
+check("first scan: all procs seen", n1 == len(procs), n1)
+check("first scan: exactly one grouped webhook", len(sent) == 1, len(sent))
+check("first scan: per-process lines stay in the audit log",
+      len(logs) == len(procs) + 1, len(logs))
+n2 = _scan_round()
+check("repeat scan: no fresh procs", n2 == 0, n2)
+check("repeat scan: no new webhook", len(sent) == 1, len(sent))
+check("repeat scan: no new audit lines", len(logs) == len(procs) + 1, len(logs))
+
+print("\n== outbound :22 local-audit-only ==")
+sent = []
+logs = []
+notified = []
+M._ssh_wh_times.clear()
+M._ssh_wh_last.clear()
+M.ssh_emit({"kind": "outbound", "account": None, "lhost": "10.11.1.5",
+            "lport": "50460", "rhost": "140.82.121.3", "rport": 22,
+            "evidence": "OBSERVED"})
+check("outbound :22 still in the local audit log",
+      any("outbound tcp" in str(m) for m in logs), str(logs))
+check("outbound :22 does not notify locally", notified == [], str(notified))
+check("outbound :22 never webhooks", sent == [], str(sent))
+M.ssh_emit({"kind": "outbound", "account": None, "lhost": "10.11.1.5",
+            "lport": "54322", "rhost": "1.2.3.4", "rport": 5900,
+            "evidence": "OBSERVED"})
+check("outbound VNC :5900 still notifies locally", len(notified) >= 1,
+      str(notified))
+check("inbound :22 connection still webhooked",
+      M._ssh_should_webhook({"kind": "ssh-connection", "account": None}))
+
+print("\n== unrelated root process is not correlated ==")
+make_proc(8000, 1, 8000, 300, "299", exe="cron", uid=0, euid=0)
+check("root proc outside the session excluded",
+      8000 not in {p["pid"] for p in M.ssh_processes("200", "1000", "bocal")})
+
+print("\n== robustness: missing status / pid reuse ==")
+make_proc(6000, 5001, 5000, 200, "200", exe="ls", write_status=False)
+rp = {p["pid"]: p for p in M.ssh_processes("200", "1000", "bocal")}
+p6000 = rp.get(6000)
+check("missing status -> uid/euid unknown",
+      p6000 and p6000["uid"] is None and p6000["euid"] is None, str(p6000))
+check("missing status -> never claimed as root/escalation",
+      p6000 and p6000["escalated"] is False and p6000["root"] is False)
+
+make_proc(7000, 5001, 5000, 400, "201", exe="touch")
+_orig_sf = M._stat_fields
+_calls = {}
+
+
+def _flaky_stat(pid):
+    _calls[pid] = _calls.get(pid, 0) + 1
+    r = _orig_sf(pid)
+    if pid == "7000" and r and _calls[pid] >= 2:
+        r = dict(r)
+        r["start_ticks"] += 1
+    return r
+
+
+M._stat_fields = _flaky_stat
+reused = {p["pid"] for p in (M.ssh_processes("201", "1000", "bocal") or [])}
+M._stat_fields = _orig_sf
+check("pid recycled mid-scan is dropped", 7000 not in reused, str(reused))
+
+print("\n== argv canary: never stored, logged, or transmitted ==")
+CANARY = "CANARY_7f3a91deadbeef"
+make_proc(9001, 5001, 5000, 500, "202", exe="sh", uid=1000, euid=1000,
+          cmdline=["/bin/sh", "-c",
+                   f"curl -H 'X-Auth: {CANARY}' http://example.invalid"])
+cp = [p for p in M.ssh_processes("202", "1000", "bocal") if p["pid"] == 9001]
+check("canary process correlated", len(cp) == 1, str(cp))
+check("canary absent from the process record",
+      CANARY not in repr(cp) and CANARY not in json.dumps(cp), repr(cp))
+act2 = M.ssh_activity({"loginctl_sid": "202", "leader_pid": 5001}, cp)
+check("canary absent from the grouped event", CANARY not in repr(act2), repr(act2))
+captured = []
+M.log_alert = lambda m: captured.append(str(m))
+M.remote_alert = lambda t, x: (captured.append(str(t)), captured.append(str(x)),
+                               True)[-1]
+M.notify = lambda *a, **k: captured.append(" ".join(str(x) for x in a))
+M._ssh_wh_times.clear()
+M._ssh_wh_last.clear()
+M.SSH_WEBHOOK_COOLDOWN = 0.0
+M.SSH_WEBHOOK_MAX = 1000
+M.ssh_emit(dict(cp[0], account="bocal"), notify_local=False, webhook=False)
+M.ssh_emit(dict(act2, account="bocal"))
+check("canary never reaches log/notify/webhook",
+      captured and all(CANARY not in c for c in captured), str(captured))
 
 # ------------------------------------------------------------------- restore
 print("\n== sandbox guard ==")
