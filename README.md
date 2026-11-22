@@ -220,33 +220,47 @@ the lock.
 `kick` handles the usual case: one `x11vnc` server shared by several viewers,
 and one `XKillClient` drops them all. `xwatch` is the wider sweep. It
 enumerates every X client on `:0` through the X-Resource extension, attributes
-each to a pid and uid, and evicts the ones that are **screen-capture tools** —
-by process identity, not by uid, because the viewer we care about is a
-root-run `x11vnc`. A uid-0 exemption would skip exactly the process we want.
+each to a pid and uid, and evicts **capture-tool candidates** — by process
+identity, not by uid, because the viewer we care about is a root-run `x11vnc`.
+A uid-0 exemption would skip exactly the process we want.
 
 ```bash
 vnc-watch xwatch --dry-run   # list every X client on :0, change nothing
-vnc-watch xwatch             # evict the capture tools (asks first)
+vnc-watch xwatch             # evict the candidates (asks first)
 vnc-watch xwatch --yes       # ... skipping the confirmation
 ```
 
-A client is a **target** when its comm is a known capture tool (`x11vnc`,
-`Xvnc`, `vino-server`, `gnome-remote-de…`, `xwd`, `ffmpeg`, `gst-launch`,
-`scrot`, `import`, `maim`, `flameshot`, screen recorders, …), the name is not
-on the protected list (`lightdm`, `Xorg`, `gnome-shell`), and its uid is not
-exempt. **root is not exempt** — it is the point. Eviction sends `XKillClient`;
-the tool loses its `:0` connection.
+A **candidate** is a process whose comm matches a dedicated capture tool
+(`x11vnc`, `Xvnc`, `vino-server`, `gnome-remote-de...`, `xwd`, `scrot`,
+`import`, `maim`, `flameshot`, `obs`, screen recorders, ...). Ambiguous
+multimedia tools (`ffmpeg`, `gst-launch`, ...) are candidates only when their
+argv also names a display grab (`x11grab`, `ximagesrc`, `xdisplay`); a plain
+transcode or playback is never treated as surveillance. **A name match is a
+candidate, not proof of active viewing.**
+
+A candidate is a **target** (would be evicted) when its name is not on the
+protected list (`lightdm`, `Xorg`, `gnome-shell`) and its uid is not exempt.
+**root is not exempt** — it is the point.
+
+Identity is revalidated immediately before every `XKillClient`: the current
+base->pid mapping must still equal the original target and its comm must be
+unchanged, otherwise the kill is skipped. This narrows, but cannot close, the
+race — the fresh lookup and the kill are separate X round-trips, so a client
+can still exit and free its base in between. Eviction is also **refused while
+an exam/lock window is active**, for normal, menu, and `--yes` invocation
+alike. There is no automatic or loop eviction.
 
 - `VNC_WATCH_X_EXEMPT_UIDS` — extra uids to never evict (comma/space separated).
 - `VNC_WATCH_X_EXEMPT_COMMS` — extra comm names to never target.
-- `VNC_WATCH_X_EVICT_SELF=1` — also evict capture tools owned by your own uid
+- `VNC_WATCH_X_EVICT_SELF=1` — also evict candidates owned by your own uid
   (off by default, so you never kill your own screenshot mid-run).
 
 Honest limits: a service that restarts its viewer brings it back (you do not
-own the restart button); the match is by process name, which root can rename;
-and a capture path with **no X client** — reading `/dev/fb0` or a kernel
-module — is invisible and unreachable from your uid. `xwatch` buys eviction,
-evidence, and cost, not prevention, against a root adversary.
+own the restart button); the match is by process name (and argv for ambiguous
+tools), which root can rename; and a capture path with **no X client** —
+reading `/dev/fb0` or a kernel module — is invisible and unreachable from your
+uid. `xwatch` buys eviction, evidence, and cost, not prevention, against a
+root adversary.
 
 ---
 
@@ -254,6 +268,24 @@ evidence, and cost, not prevention, against a root adversary.
 
 Every alert is mirrored to each configured channel, which doubles as an
 off-machine copy of the log.
+
+Off-machine payloads omit hostname and username by default; those stay local.
+Set `VNC_WATCH_ALERT_IDENTITY=host,user` to include them (explicit opt-in,
+documented here for that purpose). If the variable is unset or empty, the
+privacy-preserving default applies and no replacement identifier is added.
+The `xwatch` event payload carries event type, action, result, per-target
+pid/uid/comm, survivors, skips, and errors — but never argv/cmdline or
+filesystem paths.
+
+The event counters are derived from the per-target outcome lines, so the
+totals cannot disagree with the details. `skipped` counts safe
+identity-change skips (the base→pid binding changed before the kill, so a
+recycled resource was left alone); `errors` counts operational failures
+(the kill was attempted and failed, or was not sent). The `result` field
+reads `all connections dropped` only when every intended target was evicted
+and none survived; otherwise it is `partial` (some eviction happened) or
+`no eviction`. A lock-window refusal is delivered as
+`refused (exam/lock window; no eviction)` — never as a successful eviction.
 
 ```bash
 vnc-watch channels                 # show config (values masked)
@@ -423,6 +455,7 @@ Environment variables: `VNC_WATCH_POPUP_TIMEOUT`, `VNC_WATCH_POPUP_AUTO`,
 `VNC_WATCH_LOCK_FILE` (seat-lock guard; unset = disabled),
 `VNC_WATCH_X_EXEMPT_UIDS`, `VNC_WATCH_X_EXEMPT_COMMS`,
 `VNC_WATCH_X_EVICT_SELF` (`xwatch` targeting),
+`VNC_WATCH_ALERT_IDENTITY` (off-machine host/user; unset = private),
 `VNC_WATCH_XI_MAX`, `VNC_WATCH_LOG_MAX`, `VNC_WATCH_UTMP` (testing).
 
 ---

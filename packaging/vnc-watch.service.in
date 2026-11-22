@@ -10,6 +10,7 @@ StartLimitBurst=5
 Type=simple
 ExecStart=@PYTHON@ -u @EXEC@ watch --input-watch
 Environment=VNC_WATCH_LOCK_FILE=@LOCKFILE@
+Environment=VNC_WATCH_ALERT_IDENTITY=@ALERTIDENTITY@
 Restart=always
 RestartSec=5
 StandardOutput=append:%h/.local/state/vnc-watch/vnc-watch.out

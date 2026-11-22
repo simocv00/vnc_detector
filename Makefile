@@ -18,6 +18,11 @@ STATE      ?= $(HOME)/.local/state/vnc-watch
 # Set it for your machine, e.g. make install LOCKFILE=/run/seat-lock/seat0.json
 LOCKFILE   ?=
 
+# Off-machine alert identity. Empty = privacy-preserving default (no host or
+# user in webhook payloads). Opt in per install, e.g.
+#   make install ALERTIDENTITY=host,user
+ALERTIDENTITY ?=
+
 SRC        := vnc-watch.py
 LINK       := $(BINDIR)/vnc-watch
 UNIT       := $(UNITDIR)/vnc-watch.service
@@ -70,6 +75,7 @@ install: check
 	     -e 's|@EXEC@|$(LINK)|g' \
 	     -e 's|@DOC@|$(CURDIR)/README.md|g' \
 	     -e 's|@LOCKFILE@|$(LOCKFILE)|g' \
+	     -e 's|@ALERTIDENTITY@|$(ALERTIDENTITY)|g' \
 	     packaging/vnc-watch.service.in > "$(UNIT)"
 	@echo "unit    : $(UNIT)"
 	@if command -v systemctl >/dev/null 2>&1; then \

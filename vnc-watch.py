@@ -406,10 +406,26 @@ def remote_send_sync(title, text):
 
 
 def remote_message(kind, msg):
-    return (f"vnc-watch: {kind}",
-            f"{msg}\n\nhost: {socket.gethostname()}\n"
-            f"user: {os.environ.get('USER') or os.getuid()}\n"
-            f"time: {datetime.now():%Y-%m-%d %H:%M:%S %Z}")
+    """Payload for an off-machine alert.
+
+    Identifying fields (hostname, username) are omitted by default and kept
+    local. Set VNC_WATCH_ALERT_IDENTITY=host,user to opt in explicitly; that
+    is the only way they leave the machine, and no replacement identifier is
+    added when the variable is unset.
+    """
+    ident = os.environ.get("VNC_WATCH_ALERT_IDENTITY", "").lower()
+    fields = []
+    if "host" in ident:
+        fields.append(f"host: {socket.gethostname()}")
+    if "user" in ident:
+        fields.append(f"user: {os.environ.get('USER') or os.getuid()}")
+    lines = [msg]
+    if fields:
+        lines.append("")
+        lines.extend(fields)
+    lines.append("")
+    lines.append(f"time: {datetime.now():%Y-%m-%d %H:%M:%S %Z}")
+    return (f"vnc-watch: {kind}", "\n".join(lines))
 
 
 def channels_command(apply_sets=(), clears=(), test=False):
@@ -867,18 +883,22 @@ def proc_comm(pid):
         return "?"
 
 
-# comm names (truncated to 15 chars by the kernel) of tools that watch,
-# grab, or record the screen. Targeting by identity, not by uid: the viewer
-# we care about is a root-run x11vnc, and a uid-0 exemption would skip it.
-CAPTURE_COMMS = frozenset({
+# Tier 1: the comm name alone identifies a dedicated viewer or grabber.
+# Targeted by identity, not uid: the viewer we care about is a root-run
+# x11vnc, and a uid-0 exemption would skip it.
+DIRECT_COMMS = frozenset({
     "x11vnc", "xvnc", "xtightvnc", "x0vncserver", "vncserver", "vino-server",
-    "gnome-remote-de", "xwd", "ffmpeg", "ffplay", "ffprobe", "vvcap",
-    "gst-launch", "scrot", "import", "maim", "flameshot", "gnome-screenshot",
-    "spectacle", "recordmydesktop", "kazam", "peek", "byzanz", "x11grab",
+    "gnome-remote-de", "xwd", "scrot", "import", "maim", "flameshot",
+    "gnome-screenshot", "spectacle", "recordmydesktop", "kazam", "peek",
+    "byzanz", "obs",
 })
 # Prefix matches for names the 15-char truncation or version suffix splits.
-CAPTURE_PREFIXES = ("xfce4-screensho", "simplescreenrec", "gst-launch",
-                    "gnome-remote", "obs ", "obs-")
+DIRECT_PREFIXES = ("xfce4-screensho", "simplescreenrec", "gnome-remote")
+# Tier 2: general multimedia tools. A capture only when argv names a display
+# grab; a plain transcode/playback is a candidate, never evicted on its name.
+AMBIGUOUS_COMMS = frozenset({"ffmpeg", "ffplay", "ffprobe"})
+AMBIGUOUS_PREFIXES = ("gst-launch",)
+GRAB_TOKENS = ("x11grab", "ximagesrc", "xdisplay")
 # Processes that must never be killed even if a name collides. lightdm is the
 # uid-0 session manager; killing it ends the session you are protecting.
 PROTECTED_COMMS = frozenset({"lightdm", "Xorg", "gnome-shell"})
@@ -906,20 +926,44 @@ def exempt_comms():
     return PROTECTED_COMMS | {t for t in raw.replace(",", " ").split() if t}
 
 
-def is_capture_tool(comm):
-    """True if a process is a known screen-watcher/grabber by its comm name."""
+def proc_cmdline(pid):
+    """argv of a pid, or [] when unreadable. Used only to corroborate an
+    ambiguous multimedia tool; it never identifies a target on its own."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return [a.decode("utf-8", "replace")
+                    for a in fh.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def capture_kind(comm, pid):
+    """Classify a process name for screen capture.
+
+    'direct'       - comm alone identifies a viewer/grabber
+    'corroborated' - ambiguous multimedia tool with a display grab in argv
+    'candidate'    - ambiguous multimedia tool, no display grab (not evicted)
+    None           - not a capture tool
+
+    A name match is a candidate, never proof of active viewing.
+    """
     c = (comm or "").lower()
-    if c in CAPTURE_COMMS:
-        return True
-    return any(c.startswith(p) for p in CAPTURE_PREFIXES)
+    if c in DIRECT_COMMS or any(c.startswith(p) for p in DIRECT_PREFIXES):
+        return "direct"
+    if c in AMBIGUOUS_COMMS or any(c.startswith(p) for p in AMBIGUOUS_PREFIXES):
+        blob = " ".join(proc_cmdline(pid)).lower()
+        return ("corroborated" if any(t in blob for t in GRAB_TOKENS)
+                else "candidate")
+    return None
 
 
 def x_client_inventory():
-    """[{base,pid,uid,comm,target,why}] for every X client on :0.
+    """[{base,pid,uid,comm,candidate,target,why}] for every X client on :0.
 
-    `target` is True only for a known capture tool that is not on the protected
-    list and not owned by an exempt uid - root included. pid None means the
-    X client could not be mapped and is never a target.
+    `candidate` is True when the process matches a capture signature (name, or
+    name plus argv for ambiguous multimedia tools); it is NOT proof of active
+    viewing. `target` is True only for a candidate that also passes the
+    protected-name and exempt-uid filters. pid None is never a target.
     """
     keep = exempt_uids()
     safe = exempt_comms()
@@ -927,36 +971,103 @@ def x_client_inventory():
     for base, pid in x_clients_with_pids():
         if pid is None:
             out.append({"base": base, "pid": None, "uid": None, "comm": "?",
-                        "target": False, "why": "unmapped"})
+                        "candidate": False, "target": False,
+                        "why": "unmapped"})
             continue
         uid = proc_uid(pid)
         comm = proc_comm(pid)
-        if not is_capture_tool(comm):
-            why = "not a capture tool"
-            tgt = False
+        kind = capture_kind(comm, pid)
+        cand = kind is not None
+        if kind is None:
+            why, tgt = "not a capture tool", False
         elif comm in safe:
-            why = "protected"
-            tgt = False
+            why, tgt = "protected", False
         elif uid is not None and uid in keep:
-            why = "exempt uid"
-            tgt = False
+            why, tgt = "exempt uid", False
+        elif kind == "candidate":
+            why, tgt = "multimedia name, no display-grab in argv", False
+        elif kind == "corroborated":
+            why, tgt = "display-grab in argv, uid not exempt", True
         else:
-            why = "capture tool, uid not exempt"
-            tgt = True
+            why, tgt = "capture tool, uid not exempt", True
         out.append({"base": base, "pid": pid, "uid": uid, "comm": comm,
-                    "target": tgt, "why": why})
+                    "candidate": cand, "target": tgt, "why": why})
     return out
 
 
-def xwatch_command(apply=False, assume_yes=False):
-    """Evict X clients that are screen-watching/grabbing tools.
+def current_pid_for_base(base):
+    """Fresh XRes lookup for one resource base, or None if the base is gone or
+    unmappable. Used to revalidate a target immediately before XKillClient,
+    because the original base->pid binding may have been recycled since the
+    listing."""
+    for b, pid in x_clients_with_pids():
+        if b == base:
+            return pid
+    return None
 
-    target = a known capture tool whose uid is not exempt (root counts) and
-    whose name is not protected. Eviction drops its :0 connection with
-    XKillClient; the service may restart it. Your own uid is exempt unless
-    VNC_WATCH_X_EVICT_SELF=1, so you do not evict yourself.
+
+def _target_line(c, outcome):
+    uid = "-" if c["uid"] is None else c["uid"]
+    pid = "-" if c["pid"] is None else c["pid"]
+    return f"pid={pid} uid={uid} comm={c['comm']} -> {outcome}"
+
+
+def xwatch_event_body(result, target_lines, survivors, notes, lock_note=None):
+    """Multi-line body for the off-machine xwatch event.
+
+    Counters are DERIVED from `target_lines`, the single source of truth, so
+    the reported evicted/skipped/errors totals can never disagree with the
+    per-target outcomes listed in the same message.
+
+      evicted  -> the outcome line ends in "-> evicted"
+      skipped  -> the outcome line contains "-> skipped"
+      errors   -> every other intended target (kill raised / not sent)
+
+    A *skip* is safe race-avoidance: the base->pid binding changed before the
+    kill, so we refused to kill a recycled resource (an identity change, not a
+    failure). An *error* is operational: the kill was attempted and failed or
+    was not sent. They are counted and listed separately.
+
+    `result` ("all connections dropped" / "partial" / "no eviction" /
+    "refused (...)") is computed by the caller and echoed verbatim. The body
+    does NOT carry argv/cmdline or filesystem paths.
     """
-    print("\n== X clients on :0 (targeting capture tools) ==\n")
+    evicted = sum(1 for t in target_lines if t.endswith("-> evicted"))
+    skipped = sum(1 for t in target_lines if "-> skipped" in t)
+    errors = len(target_lines) - evicted - skipped
+    lines = ["event: xwatch", "action: evict capture-tool candidates",
+             f"result: {result}", f"targets: {len(target_lines)}",
+             f"evicted: {evicted}", f"skipped: {skipped}", f"errors: {errors}"]
+    if lock_note:
+        lines.append(f"lock: {lock_note}")
+    if target_lines:
+        lines.append("details:")
+        lines.extend("  " + t for t in target_lines[:20])
+    lines.append(f"survivors: {survivors}")
+    if notes:
+        lines.append("notes:")
+        lines.extend("  " + n for n in notes[:10])
+    return "\n".join(lines)
+
+
+def xwatch_command(apply=False, assume_yes=False):
+    """Evict X clients that are capture-tool candidates.
+
+    A candidate is a process whose comm (and, for ambiguous multimedia tools,
+    argv) matches a screen-capture signature; a match is NOT proof of active
+    viewing. `target` additionally requires a non-exempt uid (root counts) and
+    a name not on the protected list.
+
+    Identity is revalidated immediately before every XKillClient: the current
+    base->pid mapping must still equal the original target and its comm must be
+    unchanged, or the kill is skipped. This narrows, but cannot close, the
+    race: the fresh lookup and the kill are separate X round-trips, so a client
+    can still exit and free its base in the gap. See the README.
+
+    Eviction is refused while an exam/lock window is active, for normal, menu,
+    and --yes invocation alike. No automatic or loop eviction exists.
+    """
+    print("\n== X clients on :0 (capture-tool candidates) ==\n")
     try:
         inv = x_client_inventory()
     except RuntimeError as exc:
@@ -965,37 +1076,74 @@ def xwatch_command(apply=False, assume_yes=False):
     for c in sorted(inv, key=lambda r: (not r["target"],
                                         r["uid"] if r["uid"] is not None else -1,
                                         r["pid"] or 0)):
-        tag = "TARGET" if c["target"] else "ok"
+        tag = "EVICT?" if c["target"] else ("cand" if c["candidate"] else "ok")
         uid = "-" if c["uid"] is None else str(c["uid"])
         pid = "-" if c["pid"] is None else str(c["pid"])
         print(f"  {tag:<7} base=0x{c['base']:<9x} pid={pid:<8} "
               f"uid={uid:<7} {c['comm']:<16} {c['why']}")
     targets = [c for c in inv if c["target"]]
-    print(f"\n  {len(inv)} X client(s); {len(targets)} capture tool(s) to evict")
+    cands = [c for c in inv if c["candidate"]]
+    print(f"\n  {len(inv)} X client(s); {len(cands)} candidate(s); "
+          f"{len(targets)} would be evicted")
+    print("  A candidate is a signature match, not proof of active viewing.")
     if not targets:
         print("  nothing to evict\n")
         return 0
+
+    locked, why = active_lock_window()
+    if locked:
+        print(f"\n  note   : lock window active ({why}); eviction disabled")
+    if apply and locked:
+        print(f"\n  refused: {why}. Eviction is disabled during an "
+              f"exam/lock window.\n")
+        log_alert(f"action=xwatch outcome=refused-lock ({why})")
+        remote_send_sync(*remote_message(
+            "action",
+            xwatch_event_body("refused (exam/lock window; no eviction)",
+                              [], 0, [], "exam/lock window active")))
+        return 1
+
     print("\n  root is NOT exempt: a root-run viewer is the point. Eviction")
-    print("  drops the tool's connection to :0; its service may restart it.")
+    print("  drops the candidate's connection to :0; its service may restart it.")
     if not apply:
         print("\n  dry run: nothing changed\n")
         return 0
-    if not assume_yes and not confirm("Evict these capture tools now?"):
+    if not assume_yes and not confirm("Evict these capture-tool candidates now?"):
         print("cancelled\n")
         log_alert("action=xwatch outcome=cancelled")
         return 1
 
-    killed, notes = [], []
+    killed, target_lines, notes = [], [], []
+    skipped = 0            # safe identity-change skips (race avoidance)
+    errors = 0             # operational failures (kill raised / not sent)
     for c in targets:
+        fresh = current_pid_for_base(c["base"])
+        outcome = None
+        if fresh is None:
+            outcome = "skipped (base gone before kill)"
+        elif fresh != c["pid"]:
+            outcome = f"skipped (identity changed, now pid {fresh})"
+        elif proc_comm(fresh) != c["comm"]:
+            outcome = "skipped (comm changed)"
+        if outcome:
+            notes.append(f"skip base 0x{c['base']:x}: {outcome}")
+            target_lines.append(_target_line(c, outcome))
+            skipped += 1
+            continue
         try:
             sent = kill_x_client(c["base"])
         except RuntimeError as exc:
-            notes.append(f"base 0x{c['base']:x}: {exc}")
+            notes.append(f"error base 0x{c['base']:x}: {exc}")
+            target_lines.append(_target_line(c, "error"))
+            errors += 1
             continue
         if sent:
             killed.append(c)
+            target_lines.append(_target_line(c, "evicted"))
         else:
-            notes.append(f"base 0x{c['base']:x}: XKillClient not sent")
+            notes.append(f"error base 0x{c['base']:x}: XKillClient not sent")
+            target_lines.append(_target_line(c, "not sent"))
+            errors += 1
 
     # Verify by pid, not base: resource bases are recycled, so a killed base
     # 0xNN can reappear for a different client. A kill succeeded when the pid
@@ -1009,22 +1157,34 @@ def xwatch_command(apply=False, assume_yes=False):
     survivor_pids = {c["pid"] for c in killed
                      if c["pid"] is not None and c["pid"] in still_connected}
     survivors = [c for c in killed if c["pid"] in survivor_pids]
-    verified = bool(killed) and not survivor_pids
+    # Full success requires EVERY intended target evicted by us and none
+    # surviving. Any skip (target already gone / base recycled) or error leaves
+    # the run short of full, so it must never read "all connections dropped".
+    all_dropped = (bool(targets) and len(killed) == len(targets)
+                   and not survivor_pids)
+    if all_dropped:
+        result = "all connections dropped"
+    elif killed:
+        result = "partial"
+    else:
+        result = "no eviction"
 
     for c in killed:
         print(f"  evicted: pid {c['pid']} uid {c['uid']} {c['comm']}")
     for n in notes:
-        print(f"  note   : {n}")
+        print(f"  {'skip' if n.startswith('skip ') else 'error'}   : {n}")
     for c in survivors:
         print(f"  note   : pid {c['pid']} still has an X connection "
               f"(held another or reconnected)")
-    print(f"  result : {'all connections dropped' if verified else 'partial'}\n")
-    log_alert(f"action=xwatch evicted={len(killed)} "
-              f"survivors={len(survivors)} errors={len(notes)}")
+    print(f"  result : {result} "
+          f"(evicted={len(killed)} skipped={skipped} errors={errors} "
+          f"survivors={len(survivors)})\n")
+    log_alert(f"action=xwatch evicted={len(killed)} skipped={skipped} "
+              f"survivors={len(survivors)} errors={errors}")
     remote_send_sync(*remote_message(
         "action",
-        f"xwatch evicted={len(killed)} survivors={len(survivors)}"))
-    return 0 if verified else 2
+        xwatch_event_body(result, target_lines, len(survivors), notes)))
+    return 0 if all_dropped else 2
 
 
 def vnc_servers():
