@@ -5,6 +5,8 @@
     vnc-watch audit    classify every connection in the current x11vnc log
     vnc-watch portal   one-shot screencast / RDP / VNC status
     vnc-watch kick     close a running VNC server (confirmation required)
+    vnc-watch lockdown close remote access and lock the screen
+    vnc-watch xwatch   evict screen-capture tools on :0 (root included)
     vnc-watch channels remote alerts (Discord / Telegram / ntfy / WhatsApp)
     vnc-watch menu     read the daemon's state and offer manual actions
 
@@ -13,8 +15,8 @@ Flags kept as aliases for existing callers:
     --portal         same as `portal`
     --input-watch    `watch` plus XTEST injection watching
     --x-watch        `watch` plus X client count watching (noisy)
-    --yes            with `kick`: skip the interactive confirmation
-    --dry-run        with `kick`: report the target, change nothing
+    --yes            with `kick`/`xwatch`: skip the interactive confirmation
+    --dry-run        with `kick`/`xwatch`: report the target, change nothing
     --set KEY=VALUE  with `channels`: store one channel setting
     --test           with `channels`: send a test message
 
@@ -842,6 +844,187 @@ def proc_state(pid):
 def proc_dead(pid):
     """True once the process has exited or is a zombie awaiting its parent."""
     return proc_state(pid) in (None, "Z", "X")
+
+
+def proc_uid(pid):
+    """Owning uid of a pid, or None. The Uid line in /proc/<pid>/status is
+    world-readable, so another user's X client is still attributable."""
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("Uid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def proc_comm(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as fh:
+            return fh.read().strip()
+    except OSError:
+        return "?"
+
+
+# comm names (truncated to 15 chars by the kernel) of tools that watch,
+# grab, or record the screen. Targeting by identity, not by uid: the viewer
+# we care about is a root-run x11vnc, and a uid-0 exemption would skip it.
+CAPTURE_COMMS = frozenset({
+    "x11vnc", "xvnc", "xtightvnc", "x0vncserver", "vncserver", "vino-server",
+    "gnome-remote-de", "xwd", "ffmpeg", "ffplay", "ffprobe", "vvcap",
+    "gst-launch", "scrot", "import", "maim", "flameshot", "gnome-screenshot",
+    "spectacle", "recordmydesktop", "kazam", "peek", "byzanz", "x11grab",
+})
+# Prefix matches for names the 15-char truncation or version suffix splits.
+CAPTURE_PREFIXES = ("xfce4-screensho", "simplescreenrec", "gst-launch",
+                    "gnome-remote", "obs ", "obs-")
+# Processes that must never be killed even if a name collides. lightdm is the
+# uid-0 session manager; killing it ends the session you are protecting.
+PROTECTED_COMMS = frozenset({"lightdm", "Xorg", "gnome-shell"})
+
+
+def exempt_uids():
+    """Uids whose X clients are never evicted. Only this user by default -
+    root is NOT exempt, because the viewer we hunt runs as root. Extend with
+    VNC_WATCH_X_EXEMPT_UIDS. VNC_WATCH_X_EVICT_SELF=1 drops even this user."""
+    keep = set()
+    if os.environ.get("VNC_WATCH_X_EVICT_SELF", "") not in ("1", "yes", "true"):
+        keep.add(os.getuid())
+    raw = os.environ.get("VNC_WATCH_X_EXEMPT_UIDS", "")
+    for tok in raw.replace(",", " ").split():
+        try:
+            keep.add(int(tok))
+        except ValueError:
+            pass
+    return keep
+
+
+def exempt_comms():
+    """Extra comm names to never target, from VNC_WATCH_X_EXEMPT_COMMS."""
+    raw = os.environ.get("VNC_WATCH_X_EXEMPT_COMMS", "")
+    return PROTECTED_COMMS | {t for t in raw.replace(",", " ").split() if t}
+
+
+def is_capture_tool(comm):
+    """True if a process is a known screen-watcher/grabber by its comm name."""
+    c = (comm or "").lower()
+    if c in CAPTURE_COMMS:
+        return True
+    return any(c.startswith(p) for p in CAPTURE_PREFIXES)
+
+
+def x_client_inventory():
+    """[{base,pid,uid,comm,target,why}] for every X client on :0.
+
+    `target` is True only for a known capture tool that is not on the protected
+    list and not owned by an exempt uid - root included. pid None means the
+    X client could not be mapped and is never a target.
+    """
+    keep = exempt_uids()
+    safe = exempt_comms()
+    out = []
+    for base, pid in x_clients_with_pids():
+        if pid is None:
+            out.append({"base": base, "pid": None, "uid": None, "comm": "?",
+                        "target": False, "why": "unmapped"})
+            continue
+        uid = proc_uid(pid)
+        comm = proc_comm(pid)
+        if not is_capture_tool(comm):
+            why = "not a capture tool"
+            tgt = False
+        elif comm in safe:
+            why = "protected"
+            tgt = False
+        elif uid is not None and uid in keep:
+            why = "exempt uid"
+            tgt = False
+        else:
+            why = "capture tool, uid not exempt"
+            tgt = True
+        out.append({"base": base, "pid": pid, "uid": uid, "comm": comm,
+                    "target": tgt, "why": why})
+    return out
+
+
+def xwatch_command(apply=False, assume_yes=False):
+    """Evict X clients that are screen-watching/grabbing tools.
+
+    target = a known capture tool whose uid is not exempt (root counts) and
+    whose name is not protected. Eviction drops its :0 connection with
+    XKillClient; the service may restart it. Your own uid is exempt unless
+    VNC_WATCH_X_EVICT_SELF=1, so you do not evict yourself.
+    """
+    print("\n== X clients on :0 (targeting capture tools) ==\n")
+    try:
+        inv = x_client_inventory()
+    except RuntimeError as exc:
+        print(f"  detection unavailable: {exc}")
+        return 1
+    for c in sorted(inv, key=lambda r: (not r["target"],
+                                        r["uid"] if r["uid"] is not None else -1,
+                                        r["pid"] or 0)):
+        tag = "TARGET" if c["target"] else "ok"
+        uid = "-" if c["uid"] is None else str(c["uid"])
+        pid = "-" if c["pid"] is None else str(c["pid"])
+        print(f"  {tag:<7} base=0x{c['base']:<9x} pid={pid:<8} "
+              f"uid={uid:<7} {c['comm']:<16} {c['why']}")
+    targets = [c for c in inv if c["target"]]
+    print(f"\n  {len(inv)} X client(s); {len(targets)} capture tool(s) to evict")
+    if not targets:
+        print("  nothing to evict\n")
+        return 0
+    print("\n  root is NOT exempt: a root-run viewer is the point. Eviction")
+    print("  drops the tool's connection to :0; its service may restart it.")
+    if not apply:
+        print("\n  dry run: nothing changed\n")
+        return 0
+    if not assume_yes and not confirm("Evict these capture tools now?"):
+        print("cancelled\n")
+        log_alert("action=xwatch outcome=cancelled")
+        return 1
+
+    killed, notes = [], []
+    for c in targets:
+        try:
+            sent = kill_x_client(c["base"])
+        except RuntimeError as exc:
+            notes.append(f"base 0x{c['base']:x}: {exc}")
+            continue
+        if sent:
+            killed.append(c)
+        else:
+            notes.append(f"base 0x{c['base']:x}: XKillClient not sent")
+
+    # Verify by pid, not base: resource bases are recycled, so a killed base
+    # 0xNN can reappear for a different client. A kill succeeded when the pid
+    # no longer maps to any X connection; if it still does it either held a
+    # second connection or reconnected.
+    time.sleep(0.3)
+    try:
+        still_connected = {p for _b, p in x_clients_with_pids()}
+    except RuntimeError:
+        still_connected = set()
+    survivor_pids = {c["pid"] for c in killed
+                     if c["pid"] is not None and c["pid"] in still_connected}
+    survivors = [c for c in killed if c["pid"] in survivor_pids]
+    verified = bool(killed) and not survivor_pids
+
+    for c in killed:
+        print(f"  evicted: pid {c['pid']} uid {c['uid']} {c['comm']}")
+    for n in notes:
+        print(f"  note   : {n}")
+    for c in survivors:
+        print(f"  note   : pid {c['pid']} still has an X connection "
+              f"(held another or reconnected)")
+    print(f"  result : {'all connections dropped' if verified else 'partial'}\n")
+    log_alert(f"action=xwatch evicted={len(killed)} "
+              f"survivors={len(survivors)} errors={len(notes)}")
+    remote_send_sync(*remote_message(
+        "action",
+        f"xwatch evicted={len(killed)} survivors={len(survivors)}"))
+    return 0 if verified else 2
 
 
 def vnc_servers():
@@ -2346,9 +2529,10 @@ def menu():
         print("6) close a running VNC server (all viewers)")
         print("7) preview the action window (no automatic action)")
         print("8) lockdown: close remote access and lock the screen")
-        print("9) exit")
+        print("9) sweep capture tools (VNC/xwd/ffmpeg; root included)")
+        print("10) exit")
         choice = ask("select> ")
-        if choice in ("9", "q", "quit", "exit"):
+        if choice in ("10", "q", "quit", "exit"):
             print("bye")
             return 0
         if choice == "1":
@@ -2390,6 +2574,8 @@ def menu():
                 "Preview: VNC viewer attached",
                 "127.0.0.1 -> local :5900 (no real detection)", 60,
                 auto=False))
+        elif choice == "9":
+            menu_action("xwatch", lambda: xwatch_command(apply=True))
         else:
             print("unknown choice\n")
 
@@ -2401,9 +2587,10 @@ def main():
         description="Unprivileged, best-effort remote-viewing detection.")
     ap.add_argument("command", nargs="?",
                     choices=["watch", "audit", "portal", "kick", "popup",
-                             "channels", "lockdown", "shortcut", "menu"],
+                             "channels", "lockdown", "shortcut", "xwatch",
+                             "menu"],
                     help="watch (default), audit, portal, kick, popup, "
-                         "channels, lockdown, shortcut, menu")
+                         "channels, lockdown, shortcut, xwatch, menu")
     ap.add_argument("--audit", action="store_true",
                     help="alias for `audit`")
     ap.add_argument("--portal", action="store_true",
@@ -2465,6 +2652,9 @@ def main():
         return run_lockdown(lock=not args.no_lock)
     if cmd == "shortcut":
         return shortcut_command(install=not args.remove, binding=args.binding)
+    if cmd == "xwatch":
+        ensure_state_dir()
+        return xwatch_command(apply=not args.dry_run, assume_yes=args.yes)
     if cmd == "menu":
         return menu()
     return follow_live(args)

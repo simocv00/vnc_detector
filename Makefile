@@ -24,7 +24,7 @@ UNIT       := $(UNITDIR)/vnc-watch.service
 SERVICE    := vnc-watch.service
 
 .PHONY: help check install uninstall status logs restart stop start \
-        channels test popup-test shortcut lockdown audit menu run clean purge
+        channels test popup-test shortcut lockdown xwatch audit menu run clean purge
 
 help:
 	@echo "vnc-watch"
@@ -42,6 +42,7 @@ help:
 	@echo "  make test         send a test message to each channel"
 	@echo "  make popup-test   preview the action window (no auto action)"
 	@echo "  make lockdown     close any VNC/RDP session and lock the screen"
+	@echo "  make xwatch       evict screen-capture tools on :0 (root included)"
 	@echo "  make audit        classify connections in the current VNC log"
 	@echo "  make menu         interactive menu"
 	@echo "  make run          run the detector in the foreground"
@@ -132,6 +133,9 @@ popup-test:
 
 lockdown:
 	@$(LINK) lockdown
+
+xwatch:
+	@$(LINK) xwatch $(ARGS)
 
 audit:
 	@$(LINK) audit

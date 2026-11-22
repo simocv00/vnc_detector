@@ -94,6 +94,7 @@ python3 vnc-watch.py watch --input-watch
 | `vnc-watch portal` | one-shot screenshot/RDP/VNC status report |
 | `vnc-watch menu` | interactive menu of all actions |
 | `vnc-watch kick [--yes] [--dry-run]` | close a running VNC server |
+| `vnc-watch xwatch [--yes] [--dry-run]` | evict screen-capture tools on `:0` (root included) |
 | `vnc-watch popup [--no-auto]` | open the action window manually |
 | `vnc-watch lockdown [--no-lock]` | close remote access and lock the screen |
 | `vnc-watch channels [--test] [--set K=V] [--clear K]` | configure remote alerts |
@@ -211,6 +212,41 @@ vnc-watch shortcut --binding '<Control><Alt><Shift>k'
 The sequence is deliberate: eviction and locking happen locally first, and the
 network notification is sent only afterwards, so a slow webhook cannot delay
 the lock.
+
+---
+
+## Sweeping capture tools (`xwatch`)
+
+`kick` handles the usual case: one `x11vnc` server shared by several viewers,
+and one `XKillClient` drops them all. `xwatch` is the wider sweep. It
+enumerates every X client on `:0` through the X-Resource extension, attributes
+each to a pid and uid, and evicts the ones that are **screen-capture tools** —
+by process identity, not by uid, because the viewer we care about is a
+root-run `x11vnc`. A uid-0 exemption would skip exactly the process we want.
+
+```bash
+vnc-watch xwatch --dry-run   # list every X client on :0, change nothing
+vnc-watch xwatch             # evict the capture tools (asks first)
+vnc-watch xwatch --yes       # ... skipping the confirmation
+```
+
+A client is a **target** when its comm is a known capture tool (`x11vnc`,
+`Xvnc`, `vino-server`, `gnome-remote-de…`, `xwd`, `ffmpeg`, `gst-launch`,
+`scrot`, `import`, `maim`, `flameshot`, screen recorders, …), the name is not
+on the protected list (`lightdm`, `Xorg`, `gnome-shell`), and its uid is not
+exempt. **root is not exempt** — it is the point. Eviction sends `XKillClient`;
+the tool loses its `:0` connection.
+
+- `VNC_WATCH_X_EXEMPT_UIDS` — extra uids to never evict (comma/space separated).
+- `VNC_WATCH_X_EXEMPT_COMMS` — extra comm names to never target.
+- `VNC_WATCH_X_EVICT_SELF=1` — also evict capture tools owned by your own uid
+  (off by default, so you never kill your own screenshot mid-run).
+
+Honest limits: a service that restarts its viewer brings it back (you do not
+own the restart button); the match is by process name, which root can rename;
+and a capture path with **no X client** — reading `/dev/fb0` or a kernel
+module — is invisible and unreachable from your uid. `xwatch` buys eviction,
+evidence, and cost, not prevention, against a root adversary.
 
 ---
 
@@ -385,6 +421,8 @@ vnc-watch shortcut --remove   # remove the hotkey
 
 Environment variables: `VNC_WATCH_POPUP_TIMEOUT`, `VNC_WATCH_POPUP_AUTO`,
 `VNC_WATCH_LOCK_FILE` (seat-lock guard; unset = disabled),
+`VNC_WATCH_X_EXEMPT_UIDS`, `VNC_WATCH_X_EXEMPT_COMMS`,
+`VNC_WATCH_X_EVICT_SELF` (`xwatch` targeting),
 `VNC_WATCH_XI_MAX`, `VNC_WATCH_LOG_MAX`, `VNC_WATCH_UTMP` (testing).
 
 ---
