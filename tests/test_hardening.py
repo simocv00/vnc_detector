@@ -837,5 +837,16 @@ check("audit classifies streamed log",
       rc == 0 and "1 connection(s)" in text
       and "CONFIRMED RFB SESSION" in text, text[-300:])
 
+print("\n== GTK version pin (panel clear dialog must load GTK 3, not 4) ==")
+with open(SRC) as fh:
+    _src_lines = fh.read().splitlines()
+_bare = []
+for _i, _line in enumerate(_src_lines):
+    if "from gi.repository import Gtk" in _line:
+        _win = _src_lines[max(0, _i - 3):_i]
+        if not any('require_version("Gtk", "3.0")' in w for w in _win):
+            _bare.append(_i + 1)
+check("every Gtk import pins version 3.0", not _bare, f"bare imports at lines {_bare}")
+
 print(f"\nRESULT pass={PASS} fail={FAIL}")
 sys.exit(1 if FAIL else 0)

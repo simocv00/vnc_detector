@@ -4971,6 +4971,8 @@ def quit_browsers(term_grace=None, kill_grace=None):
 def _ask_passphrase_gui(parent=None):
     """GTK password prompt for the panel. Returns the passphrase or None."""
     try:
+        import gi
+        gi.require_version("Gtk", "3.0")
         from gi.repository import Gtk
     except Exception:
         return None
@@ -4995,6 +4997,8 @@ def _ask_passphrase_gui(parent=None):
 def _tray_confirm_wipe(parent=None):
     """Destructive confirm. Returns (decision, quit_first, encrypt, passphrase)
     where decision is True (proceed), False (cancel), or None (nothing to do)."""
+    import gi
+    gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk
     targets, browsers, total = _clear_survey()
     if not _clear_has_work(targets, browsers):
@@ -5229,6 +5233,8 @@ def _tray_clear():
 
 
 def _tray_ask(title, markup, detail):
+    import gi
+    gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk
     d = Gtk.MessageDialog(message_type=Gtk.MessageType.QUESTION,
                           buttons=Gtk.ButtonsType.OK_CANCEL)
@@ -5331,12 +5337,16 @@ def menu_window_command():
 
 
 def _tray_quit():
+    import gi
+    gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk
     Gtk.main_quit()
 
 
 def _tray_menu():
     """The click menu shared by both tray backends. Returns (menu, status)."""
+    import gi
+    gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk
     menu = Gtk.Menu()
     status = Gtk.MenuItem(label="vnc-watch: starting…")
