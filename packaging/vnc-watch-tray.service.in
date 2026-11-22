@@ -1,0 +1,20 @@
+[Unit]
+Description=vnc-watch tray icon (white = idle, red = viewer attached)
+Documentation=file:@DOC@
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=VNC_WATCH_TRAY_BACKEND=@TRAYBACKEND@
+ExecStart=@PYTHON@ -u @EXEC@ tray
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:%h/.local/state/vnc-watch/vnc-watch-tray.out
+StandardError=append:%h/.local/state/vnc-watch/vnc-watch-tray.out
+
+[Install]
+WantedBy=graphical-session.target

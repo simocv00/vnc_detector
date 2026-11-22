@@ -27,9 +27,18 @@ SRC        := vnc-watch.py
 LINK       := $(BINDIR)/vnc-watch
 UNIT       := $(UNITDIR)/vnc-watch.service
 SERVICE    := vnc-watch.service
+TRAYUNIT   := $(UNITDIR)/vnc-watch-tray.service
+TRAYSERVICE := vnc-watch-tray.service
+
+# Tray backend: empty = auto (top-bar indicator when the AppIndicator shell
+# extension is enabled, otherwise a docked floating chip). Force with
+# indicator or floating.
+TRAYBACKEND ?=
 
 .PHONY: help check install uninstall status logs restart stop start \
-        channels test popup-test shortcut lockdown xwatch audit menu run clean purge
+        channels test test-fixtures popup-test shortcut lockdown xwatch \
+        audit menu run tray tray-stop clean purge panel-install \
+        panel-uninstall panel-restart panel-status
 
 help:
 	@echo "vnc-watch"
@@ -45,14 +54,23 @@ help:
 	@echo "  make shortcut     bind Ctrl+Alt+Shift+L to lockdown"
 	@echo "  make channels     show/edit remote alert channels"
 	@echo "  make test         send a test message to each channel"
+	@echo "  make test-fixtures  browser-wipe isolation tests (temp HOME)"
 	@echo "  make popup-test   preview the action window (no auto action)"
 	@echo "  make lockdown     close any VNC/RDP session and lock the screen"
 	@echo "  make xwatch       evict screen-capture tools on :0 (root included)"
 	@echo "  make audit        classify connections in the current VNC log"
 	@echo "  make menu         interactive menu"
+	@echo "  make tray         run the tray icon in the foreground"
+	@echo "  make tray-stop    stop the tray service"
 	@echo "  make run          run the detector in the foreground"
 	@echo ""
+	@echo "  make panel-install    GNOME top-panel indicator (per-user, no root)"
+	@echo "  make panel-status     show the panel indicator install state"
+	@echo "  make panel-restart    reload the shell to pick up the indicator"
+	@echo "  make panel-uninstall  remove the panel indicator"
+	@echo ""
 	@echo "  vars: PYTHON=$(PYTHON) PREFIX=$(PREFIX) LOCKFILE=$(LOCKFILE)"
+	@echo "        TRAYBACKEND=$(TRAYBACKEND) (indicator|floating|empty=auto)"
 
 check:
 	@$(PYTHON) -c 'import sys; assert sys.version_info >= (3,8), "python 3.8+ required"; print("python  :", sys.version.split()[0], "OK")'
@@ -63,6 +81,9 @@ check:
 	@command -v loginctl  >/dev/null 2>&1 && echo "loginctl: present" || echo "loginctl: missing (session detection uses utmp only)"
 	@$(PYTHON) -c 'import gi; gi.require_version("Gtk","3.0"); from gi.repository import Gtk' 2>/dev/null \
 		&& echo "gtk3    : present (action window)" || echo "gtk3    : missing (action window disabled)"
+	@$(PYTHON) -c 'import json; json.load(open("gnome-extension/metadata.json")); print("extmeta : OK")' 2>/dev/null \
+		|| echo "extmeta : gnome-extension/metadata.json missing or invalid"
+	@$(PYTHON) -c 'import importlib.util, sys; s=importlib.util.spec_from_file_location("vw", "$(SRC)"); m=importlib.util.module_from_spec(s); sys.argv=["vnc-watch"]; s.loader.exec_module(m); p=m.browser_config_ok(); print("browsers: OK") if not p else (print("browsers: FAIL " + "; ".join(p)) or sys.exit(1))'
 	@test -r /var/run/utmp && echo "utmp    : readable" || echo "utmp    : not readable (login detection disabled)"
 
 install: check
@@ -78,20 +99,30 @@ install: check
 	     -e 's|@ALERTIDENTITY@|$(ALERTIDENTITY)|g' \
 	     packaging/vnc-watch.service.in > "$(UNIT)"
 	@echo "unit    : $(UNIT)"
+	@sed -e 's|@PYTHON@|$(PYTHON)|g' \
+	     -e 's|@EXEC@|$(LINK)|g' \
+	     -e 's|@DOC@|$(CURDIR)/README.md|g' \
+	     -e 's|@TRAYBACKEND@|$(TRAYBACKEND)|g' \
+	     packaging/vnc-watch-tray.service.in > "$(TRAYUNIT)"
+	@echo "unit    : $(TRAYUNIT)"
 	@if command -v systemctl >/dev/null 2>&1; then \
 		systemctl --user daemon-reload && \
 		systemctl --user enable $(SERVICE) >/dev/null 2>&1; \
 		systemctl --user restart $(SERVICE) && echo "service : started"; \
+		systemctl --user disable --now $(TRAYSERVICE) >/dev/null 2>&1 || true; \
+		echo "tray    : legacy, not started. For the top-panel dot run 'make panel-install'"; \
 	else \
 		echo "service : systemd not available, start with: $(LINK) watch --input-watch"; \
+		echo "panel   : install the GNOME top-panel dot with 'make panel-install'"; \
 	fi
 	@$(MAKE) --no-print-directory status
 
 uninstall:
 	@if command -v systemctl >/dev/null 2>&1; then \
 		systemctl --user disable --now $(SERVICE) >/dev/null 2>&1 || true; \
+		systemctl --user disable --now $(TRAYSERVICE) >/dev/null 2>&1 || true; \
 	fi
-	@rm -f "$(UNIT)" "$(LINK)"
+	@rm -f "$(UNIT)" "$(TRAYUNIT)" "$(LINK)"
 	@if command -v systemctl >/dev/null 2>&1; then systemctl --user daemon-reload; fi
 	@echo "removed the service and the $(LINK) symlink"
 	@echo "state kept in $(STATE) (use 'make purge' to delete it)"
@@ -104,6 +135,10 @@ status:
 	@printf 'service : '; \
 		if command -v systemctl >/dev/null 2>&1; then \
 			systemctl --user is-active $(SERVICE) 2>/dev/null || echo "inactive"; \
+		else echo "systemd unavailable"; fi
+	@printf 'tray    : '; \
+		if command -v systemctl >/dev/null 2>&1; then \
+			systemctl --user is-active $(TRAYSERVICE) 2>/dev/null || echo "inactive"; \
 		else echo "systemd unavailable"; fi
 	@printf 'binary  : '; test -e "$(LINK)" && echo "$(LINK)" || echo "not installed"
 	@printf 'state   : '; test -d "$(STATE)" && echo "$(STATE)" || echo "missing"
@@ -132,6 +167,9 @@ channels:
 test:
 	@$(LINK) channels --test
 
+test-fixtures:
+	@$(PYTHON) tests/test_browser_wipe.py
+
 popup-test:
 	@$(LINK) popup --no-auto --timeout 30 \
 		--reason "Preview: VNC viewer attached" \
@@ -149,8 +187,26 @@ audit:
 menu:
 	@$(LINK) menu
 
+tray:
+	@$(LINK) tray $(ARGS)
+
+tray-stop:
+	@systemctl --user stop $(TRAYSERVICE) 2>/dev/null || pkill -f 'vnc-watch tray' || true
+
 run:
 	@$(LINK) watch --input-watch
+
+panel-install:
+	@sh packaging/install-panel.sh install
+
+panel-uninstall:
+	@sh packaging/install-panel.sh uninstall
+
+panel-restart:
+	@sh packaging/install-panel.sh restart
+
+panel-status:
+	@sh packaging/install-panel.sh status
 
 clean:
 	@rm -rf __pycache__

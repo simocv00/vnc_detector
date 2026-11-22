@@ -9,6 +9,9 @@
     vnc-watch xwatch   evict screen-capture tools on :0 (root included)
     vnc-watch channels remote alerts (Discord / Telegram / ntfy / WhatsApp)
     vnc-watch menu     read the daemon's state and offer manual actions
+    vnc-watch tray     top-bar icon: white when idle, red when a viewer is
+                       attached; click for quick actions (clear browser +
+                       Discord data, kick, lock)
 
 Flags kept as aliases for existing callers:
     --audit          same as `audit`
@@ -40,6 +43,7 @@ State directory: ~/.local/state/vnc-watch/   (created 0700; files 0600)
     xinput-xi2.log.err   why xinput exited, if it did
     state.json           daemon -> menu snapshot, written atomically
     ack.json             menu acknowledgements (bookkeeping only)
+    tray-*.png           tray icon (generated on first run, 0600)
 
 Confidence vocabulary - protocol evidence only, never "a human is watching":
     CONFIRMED RFB SESSION  "Pixel format" seen for that connection
@@ -65,7 +69,9 @@ import os
 import queue
 import re
 import shutil
+import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -1372,20 +1378,40 @@ def close_rdp(apply=False):
 # never followed out of it, and every removal is written to the alert log.
 # Running browsers may re-flush some databases from memory; close them for a
 # complete wipe.
-WIPE_ITEMS = [
-    # Chromium-family
-    "History", "History-journal", "History-wal", "History-shm",
-    "Cookies", "Cookies-journal",
-    "Network/Cookies", "Network/Cookies-journal",
+# Chromium-family per-profile data. Everything here is deleted whole (the
+# bookmark file lives separately, so nothing in this list holds bookmarks).
+# SQLite databases are removed as files together with their -journal/-wal/-shm
+# sidecars (see SQLITE_SIDECARS); no row-level editing is done for these.
+CHROMIUM_WIPE_ITEMS = [
+    # history and download history (History holds both)
+    "History", "Visited Links", "Top Sites",
+    # autofill / credentials (no preservation wanted)
+    "Web Data", "Login Data", "Login Data For Account", "Affiliation Database",
+    # cookies and sessions
+    "Cookies", "Network/Cookies",
     "Sessions", "Session Storage", "Local Storage", "IndexedDB",
+    # caches
     "Cache", "Code Cache", "GPUCache", "Service Worker",
-    "Shared Dictionary", "WebStorage",
-    # Firefox
-    "places.sqlite", "places.sqlite-wal", "places.sqlite-shm",
-    "cookies.sqlite", "cookies.sqlite-wal", "cookies.sqlite-shm",
-    "sessionstore-backups", "storage", "cache2", "startupCache",
-    "shader-cache", "crashes",
+    "Shared Dictionary", "WebStorage", "Storage",
+    # network / connection state
+    "Network Persistent State", "Network/Network Persistent State",
+    "Network/TransportSecurity", "TransportSecurity",
 ]
+# Firefox per-profile data. places.sqlite is NOT in this list: it holds
+# bookmarks as well as history, so it is opened and cleaned via SQL
+# (see _clean_firefox_places) so bookmarks survive. formhistory.sqlite holds
+# form/autofill history and is deleted whole.
+FIREFOX_WIPE_ITEMS = [
+    "cookies.sqlite", "formhistory.sqlite", "webappsstore.sqlite",
+    "logins.json", "logins-backup.json", "key4.db", "key3.db",
+    "signons.sqlite",
+    "sessionstore-backups", "sessionstore.jsonlz4",
+    "storage", "cache2", "startupCache", "shader-cache", "crashes",
+]
+SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
+# places.sqlite is NOT deleted: it holds bookmarks as well as history. It is
+# opened and cleaned via SQL (see _clean_firefox_places) so bookmarks survive.
+FIREFOX_PLACES = "places.sqlite"
 DISCORD_ROOTS = ["~/.config/discord", "~/.config/discordcanary",
                  "~/.config/discordptb", "~/.config/BetterDiscord"]
 DISCORD_ITEMS = ["Cache", "Code Cache", "GPUCache", "Local Storage",
@@ -1423,41 +1449,223 @@ def _remove_path(path, apply):
     return size
 
 
+def _remove_path_with_sidecars(path, apply):
+    """Remove a path and, for a file, its SQLite -journal/-wal/-shm siblings.
+
+    Deleting a database file without its WAL/SHM siblings leaves rows behind
+    in the -wal, so a whole-file database removal always takes the sidecars
+    too. The sidecars never exist without the main file, but a stale one is
+    still collected."""
+    freed = _remove_path(path, apply)
+    was_dir = os.path.isdir(path) and not os.path.islink(path)
+    if not was_dir:
+        for suffix in SQLITE_SIDECARS:
+            freed += _remove_path(path + suffix, apply)
+    return freed
+
+
+def _file_in_use(path):
+    """pid of any same-user process holding `path` open, else None.
+
+    The last safety net before deleting: even if a browser was not detected by
+    name, an open file descriptor means something is using the file. Never
+    delete out from under a live process."""
+    try:
+        target = os.path.realpath(path)
+    except OSError:
+        return None
+    if not os.path.exists(target):
+        return None
+    uid = os.getuid()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            fddir = f"/proc/{pid}/fd"
+            for fd in os.listdir(fddir):
+                try:
+                    link = os.readlink(os.path.join(fddir, fd))
+                except OSError:
+                    continue
+                if link.endswith(" (deleted)"):
+                    link = link[:-10]
+                if link == target:
+                    return int(pid)
+        except OSError:
+            continue
+    return None
+
+
+def _clean_firefox_places(path, apply):
+    """Clean a Firefox places.sqlite while keeping bookmarks.
+
+    Deleted: history visits, typed-input history, and places not referenced by
+    any bookmark. Kept: the bookmark tree (moz_bookmarks and the places they
+    point at) and bookmark annotations (moz_items_annos). Never deletes the
+    file. Raises RuntimeError on any failure (open, lock, checkpoint, vacuum,
+    integrity) so the caller skips it rather than leaving a half-cleaned or
+    corrupt database.
+    """
+    if not in_home(path):
+        raise RuntimeError("refusing path outside home")
+    if not apply:
+        return _size_of(path)
+    before = _size_of(path)
+    try:
+        con = sqlite3.connect(path, timeout=1.0)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"cannot open: {exc}")
+    try:
+        cur = con.cursor()
+        have = {r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "moz_places" not in have:
+            raise RuntimeError("not a Firefox places database")
+        cur.execute("PRAGMA foreign_keys=OFF")
+        cur.execute("PRAGMA secure_delete=ON")  # scrub freed pages on VACUUM
+        cur.execute("BEGIN IMMEDIATE")          # lock now, fail fast if in use
+        cur.execute("DELETE FROM moz_historyvisits")
+        if "moz_inputhistory" in have:
+            cur.execute("DELETE FROM moz_inputhistory")
+        cur.execute("DELETE FROM moz_places WHERE id NOT IN "
+                    "(SELECT fk FROM moz_bookmarks WHERE fk IS NOT NULL)")
+        if "moz_annos" in have:
+            cur.execute("DELETE FROM moz_annos WHERE place_id NOT IN "
+                        "(SELECT id FROM moz_places)")
+        con.commit()
+        # The WAL may still hold pre-delete rows. A TRUNCATE checkpoint must
+        # succeed before we consider the clean complete; if it cannot, stop.
+        try:
+            row = cur.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"wal_checkpoint failed: {exc}")
+        if row and row[0] > 0:                  # busy: not fully checkpointed
+            raise RuntimeError(f"wal_checkpoint busy ({row[0]})")
+        try:
+            cur.execute("VACUUM")               # secure_delete overwrites pages
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"vacuum failed: {exc}")
+        ic = cur.execute("PRAGMA integrity_check").fetchone()
+        if not ic or ic[0] != "ok":
+            raise RuntimeError(f"integrity_check: {ic[0] if ic else 'no row'}")
+    except sqlite3.Error as exc:
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        raise RuntimeError(f"sqlite: {exc}")
+    finally:
+        con.close()
+    # Checkpoint succeeded, so the sidecars are empty snapshots: drop them.
+    for suffix in ("-wal", "-shm"):
+        side = path + suffix
+        if os.path.lexists(side):
+            try:
+                os.unlink(side)
+            except OSError:
+                pass
+    return max(0, before - _size_of(path))
+
+
+def browser_config_ok():
+    """Return a list of problems with the BROWSERS table (empty = consistent).
+
+    Guards the invariant that every browser both has profiles to discover and
+    a process marker to detect, so a browser can never block cleanup without
+    being handled (or be handled without being detectable)."""
+    problems = []
+    if not BROWSER_ROOTS:
+        problems.append("no browser roots defined")
+    if not BROWSER_COMMS:
+        problems.append("no browser process markers defined")
+    for b in BROWSERS:
+        if not b.get("roots"):
+            problems.append(f"{b['name']}: no roots")
+        if not b.get("comms"):
+            problems.append(f"{b['name']}: no process markers")
+    return problems
+
+
 def wipe_targets():
-    """[(label, path)] of existing browser and Discord data to remove."""
+    """[(label, path, kind)] of existing browser and Discord data to clean.
+
+    kind is "remove" (delete the file/dir) or "places" (SQL-clean a Firefox
+    places.sqlite, preserving bookmarks)."""
     targets = []
     seen = set()
-    for label, rel in BROWSER_ROOTS:
-        root = os.path.expanduser(rel)
-        if not os.path.isdir(root):
-            continue
-        for prof in discover_profiles(root):
-            for item in WIPE_ITEMS:
-                p = os.path.join(prof, item)
-                if os.path.lexists(p) and p not in seen:
-                    seen.add(p)
-                    targets.append((f"{label}/{os.path.basename(prof)}", p))
+
+    def add(label, path, kind="remove"):
+        if os.path.lexists(path) and path not in seen:
+            seen.add(path)
+            targets.append((label, path, kind))
+
+    for b in BROWSERS:
+        family = b["family"]
+        items = (FIREFOX_WIPE_ITEMS if family == "firefox"
+                 else CHROMIUM_WIPE_ITEMS)
+        for label, rel in b["roots"]:
+            root = os.path.expanduser(rel)
+            if not os.path.isdir(root):
+                continue
+            for prof in discover_profiles(root, family):
+                base = f"{label}/{os.path.basename(prof)}"
+                for item in items:
+                    add(base, os.path.join(prof, item))
+                if family == "firefox":
+                    add(base, os.path.join(prof, FIREFOX_PLACES), "places")
     for rel in DISCORD_ROOTS:
         root = os.path.expanduser(rel)
         if not os.path.isdir(root):
             continue
         for item in DISCORD_ITEMS:
-            p = os.path.join(root, item)
-            if os.path.lexists(p) and p not in seen:
-                seen.add(p)
-                targets.append((f"discord/{os.path.basename(root)}", p))
+            add(f"discord/{os.path.basename(root)}", os.path.join(root, item))
     return targets
 
 
-def wipe_private_data(apply=True):
-    """Delete browser history/cookies/sessions/caches and Discord storage.
+def wipe_private_data(apply=True, allow_running=False):
+    """Delete browser history/cookies/sessions/caches/credentials and Discord
+    storage.
 
-    Returns {'items': [(label, path, bytes)], 'total': int, 'errors': [...]}.
+    Refuses to clean a category whose application is still running (unless
+    `allow_running`), and refuses any individual path a same-user process holds
+    open, so a live file is never deleted out from under a process. Chromium-
+    family databases are deleted whole with their WAL/SHM sidecars; Firefox
+    places.sqlite is cleaned in place with bookmarks preserved.
+
+    Returns {'items': [(label, path, bytes)], 'total': int, 'errors': [...],
+             'skipped': [...]}.
     """
-    res = {"items": [], "total": 0, "errors": []}
-    for label, path in wipe_targets():
+    res = {"items": [], "total": 0, "errors": [], "skipped": []}
+    browsers = running_browsers()
+    discord = running_discord()
+    discord_roots = [os.path.expanduser(r) for r in DISCORD_ROOTS]
+    for label, path, kind in wipe_targets():
+        is_discord = label.startswith("discord/") or any(
+            path.startswith(r + os.sep) or path == r for r in discord_roots)
+        if apply and not allow_running:
+            if browsers and not is_discord:
+                res["skipped"].append(
+                    f"{path}: a browser is running (not stopped)")
+                continue
+            if discord and is_discord:
+                res["skipped"].append(
+                    f"{path}: Discord is running (not stopped)")
+                continue
+        if apply:
+            holder = _file_in_use(path)
+            if holder is not None:
+                res["skipped"].append(
+                    f"{path}: in use by pid {holder} (not stopped)")
+                continue
         try:
-            n = _remove_path(path, apply)
+            if kind == "places":
+                n = _clean_firefox_places(path, apply)
+            else:
+                n = _remove_path_with_sidecars(path, apply)
         except (OSError, RuntimeError) as exc:
             res["errors"].append(f"{path}: {exc}")
             continue
@@ -1466,9 +1674,12 @@ def wipe_private_data(apply=True):
     if apply:
         log_alert(f"wipe: removed {len(res['items'])} item(s), "
                   f"{res['total'] / 1048576:.1f} MB, "
-                  f"{len(res['errors'])} error(s)")
+                  f"{len(res['errors'])} error(s), "
+                  f"{len(res['skipped'])} skipped")
         for label, path, n in res["items"]:
             log_alert(f"wipe: {label} {path} ({n / 1048576:.1f} MB)")
+        for s in res["skipped"]:
+            log_alert(f"wipe skipped: {s}")
     return res
 
 
@@ -2352,23 +2563,58 @@ def follow_live(args):
 
 
 # -------------------------------------------------------------------- menu
-BROWSER_ROOTS = [
-    ("chrome (native)", "~/.config/google-chrome"),
-    ("chromium (native)", "~/.config/chromium"),
-    ("chrome (flatpak)", "~/.var/app/com.google.Chrome/config/google-chrome"),
-    ("chromium (flatpak)", "~/.var/app/org.chromium.Chromium/config/chromium"),
-    ("firefox (native)", "~/.mozilla/firefox"),
-    ("firefox (flatpak)", "~/.var/app/org.mozilla.firefox/.mozilla/firefox"),
-    ("brave (native)", "~/.config/BraveSoftware/Brave-Browser"),
-    ("brave (flatpak)",
-     "~/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"),
+# One table is the single source of truth. BROWSER_ROOTS and BROWSER_COMMS are
+# derived from it so a browser can never be detectable but unhandled, or
+# handled but undetectable (see browser_config_ok).
+BROWSERS = [
+    {"name": "firefox", "family": "firefox",
+     "roots": [("firefox (native)", "~/.mozilla/firefox"),
+               ("firefox (flatpak)",
+                "~/.var/app/org.mozilla.firefox/.mozilla/firefox")],
+     "comms": ["firefox"], "flatpak_ids": ["org.mozilla.firefox"]},
+    {"name": "chromium", "family": "chromium",
+     "roots": [("chromium (native)", "~/.config/chromium"),
+               ("chromium (flatpak)",
+                "~/.var/app/org.chromium.Chromium/config/chromium")],
+     "comms": ["chromium", "chromium-browse"],
+     "flatpak_ids": ["org.chromium.Chromium"]},
+    {"name": "google-chrome", "family": "chromium",
+     "roots": [("chrome (native)", "~/.config/google-chrome"),
+               ("chrome (flatpak)",
+                "~/.var/app/com.google.Chrome/config/google-chrome")],
+     "comms": ["chrome"], "flatpak_ids": ["com.google.Chrome"]},
+    {"name": "brave", "family": "chromium",
+     "roots": [("brave (native)", "~/.config/BraveSoftware/Brave-Browser"),
+               ("brave (flatpak)",
+                "~/.var/app/com.brave.Browser/config/BraveSoftware/"
+                "Brave-Browser")],
+     "comms": ["brave"], "flatpak_ids": ["com.brave.Browser"]},
+    {"name": "edge", "family": "chromium",
+     "roots": [("edge (native)", "~/.config/microsoft-edge"),
+               ("edge (flatpak)",
+                "~/.var/app/com.microsoft.Edge/config/microsoft-edge")],
+     "comms": ["msedge"], "flatpak_ids": ["com.microsoft.Edge"]},
+    {"name": "vivaldi", "family": "chromium",
+     "roots": [("vivaldi (native)", "~/.config/vivaldi"),
+               ("vivaldi (flatpak)",
+                "~/.var/app/com.vivaldi.Vivaldi/config/vivaldi")],
+     "comms": ["vivaldi-bin", "vivaldi"],
+     "flatpak_ids": ["com.vivaldi.Vivaldi"]},
+    {"name": "opera", "family": "opera",
+     "roots": [("opera (native)", "~/.config/opera"),
+               ("opera (flatpak)",
+                "~/.var/app/com.opera.Opera/config/opera")],
+     "comms": ["opera"], "flatpak_ids": ["com.opera.Opera"]},
 ]
+BROWSER_ROOTS = [(label, rel) for b in BROWSERS for label, rel in b["roots"]]
+BROWSER_COMMS = {c for b in BROWSERS for c in b["comms"]}
 PROFILE_FILES = ["History", "Cookies", "Login Data", "Web Data", "Bookmarks",
                  "Preferences", "places.sqlite", "cookies.sqlite",
                  "logins.json", "key4.db", "cert9.db"]
 PROFILE_DIRS = ["Cache", "Code Cache", "cache2"]
-BROWSER_COMMS = {"chrome", "chromium", "chromium-browser", "firefox",
-                 "msedge", "brave"}
+# Profile subdirectories to ignore when scanning a Chromium-family root.
+PROFILE_SKIP = {"guest profile", "system profile", "crashpad", "shadercache",
+                "component crx cache", "graphiteDawnCache", "grshader cache"}
 
 
 def dir_size(path, limit=20000):
@@ -2391,60 +2637,142 @@ def in_home(path):
     return real == home or real.startswith(home + os.sep)
 
 
-def discover_profiles(root):
-    """Profile subdirectories that actually contain browser data."""
+def discover_profiles(root, family="chromium"):
+    """Profile directories under `root` that hold browser data.
+
+    firefox: entries named in profiles.ini, else any dir with places.sqlite or
+             cookies.sqlite. chromium: `Default` and `Profile N`, plus any dir
+             that already holds profile files. opera: subdirectories, and a
+             legacy install that keeps its profile files directly in `root`."""
     found = []
     try:
         entries = list(os.scandir(root))
     except OSError:
         return found
+
+    def names_of(path):
+        try:
+            return set(os.listdir(path))
+        except OSError:
+            return set()
+
+    if family == "firefox":
+        ini = os.path.join(root, "profiles.ini")
+        try:
+            import configparser
+            cp = configparser.ConfigParser()
+            cp.read(ini)
+            for sec in cp.sections():
+                if not sec.lower().startswith("profile"):
+                    continue
+                p = cp.get(sec, "Path", fallback=None)
+                if not p:
+                    continue
+                cand = p if os.path.isabs(p) else os.path.join(root, p)
+                if os.path.isdir(cand) and cand not in found:
+                    found.append(cand)
+        except (OSError, configparser.Error):
+            pass
+        if found:
+            return found
+        for e in entries:
+            if e.is_dir(follow_symlinks=False) and (
+                    names_of(e.path) & {"places.sqlite", "cookies.sqlite"}):
+                found.append(e.path)
+        return found
+
     for e in entries:
         if not e.is_dir(follow_symlinks=False):
             continue
-        try:
-            names = set(os.listdir(e.path))
-        except OSError:
+        if e.name.lower() in PROFILE_SKIP:
             continue
-        if names & set(PROFILE_FILES) or "Cache" in names or "cache2" in names:
+        names = names_of(e.path)
+        if (e.name == "Default" or e.name.startswith("Profile ")
+                or names & set(PROFILE_FILES)
+                or {"History", "Cookies", "Cache", "cache2"} & names):
             found.append(e.path)
+    if family == "opera":
+        names = names_of(root)                # legacy: profile files at root
+        if (names & set(PROFILE_FILES)
+                or {"History", "Cookies"} & names) and root not in found:
+            found.insert(0, root)
     return found
 
 
 def browser_inventory():
     print("== browser inventory (metadata only: existence and size) ==\n")
     any_found = False
-    for label, rel in BROWSER_ROOTS:
-        root = os.path.expanduser(rel)
-        if not os.path.isdir(root):
-            continue
-        if not in_home(root):
-            print(f"{label}: {root} is outside your home - skipped")
-            continue
-        any_found = True
-        total, truncated = dir_size(root)
-        print(f"{label}: {root}")
-        print(f"  total: {total / 1048576:.1f} MB"
-              f"{' (partial scan)' if truncated else ''}")
-        for prof in discover_profiles(root):
-            size, _ = dir_size(prof)
-            print(f"  profile {os.path.basename(prof)}: {size / 1048576:.1f} MB")
-            for name in PROFILE_FILES:
-                p = os.path.join(prof, name)
-                try:
-                    st = os.lstat(p)
-                    print(f"    {name:<16} {st.st_size:>10} bytes")
-                except OSError:
-                    pass
-            for name in PROFILE_DIRS:
-                p = os.path.join(prof, name)
-                if os.path.isdir(p):
-                    size, _ = dir_size(p)
-                    print(f"    {name + '/':<16} {size:>10} bytes")
-        print()
+    for b in BROWSERS:
+        for label, rel in b["roots"]:
+            root = os.path.expanduser(rel)
+            if not os.path.isdir(root):
+                continue
+            if not in_home(root):
+                print(f"{label}: {root} is outside your home - skipped")
+                continue
+            any_found = True
+            total, truncated = dir_size(root)
+            print(f"{label}: {root}")
+            print(f"  total: {total / 1048576:.1f} MB"
+                  f"{' (partial scan)' if truncated else ''}")
+            for prof in discover_profiles(root, b["family"]):
+                size, _ = dir_size(prof)
+                print(f"  profile {os.path.basename(prof)}: "
+                      f"{size / 1048576:.1f} MB")
+                for name in PROFILE_FILES:
+                    p = os.path.join(prof, name)
+                    try:
+                        st = os.lstat(p)
+                        print(f"    {name:<16} {st.st_size:>10} bytes")
+                    except OSError:
+                        pass
+                for name in PROFILE_DIRS:
+                    p = os.path.join(prof, name)
+                    if os.path.isdir(p):
+                        size, _ = dir_size(p)
+                        print(f"    {name + '/':<16} {size:>10} bytes")
+            print()
     if not any_found:
         print("No browser profile directories found.")
     print("Nothing was opened, read, or deleted. No history, cookies, or "
           "credentials were accessed.")
+
+
+def _marker_matches(name):
+    """True if a process name matches a known browser marker exactly.
+
+    Browser comms are short (all under the 15-char comm limit) and each marker
+    is a full process name, so an exact match is both sufficient and safe. It
+    avoids catching look-alike helpers such as `chrome_crashpad` (a crashpad
+    handler, not a browser) or `brave-browser-s` (the launcher shell script)."""
+    return (name or "").lower() in BROWSER_COMMS
+
+
+def _is_browser_proc(pid, comm):
+    """Detect a browser by comm, cmdline argv0, or flatpak cgroup app-id."""
+    if _marker_matches(comm):
+        return True
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+        first = raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+        argv0 = os.path.basename(first).lower()
+        if argv0.endswith(".exe"):
+            argv0 = argv0[:-4]
+        if _marker_matches(argv0):
+            return True
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/cgroup") as fh:
+            cg = fh.read()
+    except OSError:
+        cg = ""
+    for b in BROWSERS:
+        for fid in b.get("flatpak_ids", ()):
+            if f"app-{fid}" in cg or f"/{fid}" in cg:
+                return True
+    return False
 
 
 def running_browsers():
@@ -2461,7 +2789,27 @@ def running_browsers():
                 comm = fh.read().strip()
         except OSError:
             continue
-        if comm.lower() in BROWSER_COMMS:
+        if _is_browser_proc(pid, comm):
+            out.append((int(pid), comm or "?"))
+    return sorted(out)
+
+
+def running_discord():
+    """This user's Discord processes (native or flatpak)."""
+    out = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return out
+    for pid in pids:
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                continue
+            with open(f"/proc/{pid}/comm") as fh:
+                comm = fh.read().strip().lower()
+        except OSError:
+            continue
+        if comm.startswith("discord") or comm in ("betterdiscord",):
             out.append((int(pid), comm))
     return sorted(out)
 
@@ -2670,6 +3018,35 @@ def menu_close_vnc():
         log_alert(f"menu action=close_vnc outcome=error:{type(exc).__name__}")
 
 
+def menu_clear():
+    """Terminal-menu clear action. Same guarded path as the panel/tray wipe,
+    confirmed in the terminal rather than a GTK dialog."""
+    locked, why = active_lock_window()
+    if locked:
+        print(f"clear refused: {why} (exam/lock window active)\n")
+        log_alert(f"menu action=clear outcome=refused:{why}")
+        return
+    items = wipe_targets()
+    if not items:
+        print("nothing to clear (no browser or Discord data found)\n")
+        return
+    total = sum(_size_of(p) for _l, p, _k in items)
+    prompt = (f"Delete browser data and Discord storage? {len(items)} item(s), "
+              f"about {total / 1048576:.1f} MB — history, cookies, sessions, "
+              f"caches, autofill and saved logins. Bookmarks are kept. This "
+              f"logs you out of sites and Discord and cannot be undone.")
+    if not confirm(prompt):
+        print("cancelled\n")
+        log_alert("menu action=clear outcome=cancelled")
+        return
+    try:
+        parts, _q, _res = _wipe_and_summary(True)
+        print("; ".join(parts) + "\n")
+    except Exception as exc:                 # report, never crash the menu
+        print(f"clear failed: {exc}\n")
+        log_alert(f"menu action=clear outcome=error:{type(exc).__name__}")
+
+
 def menu():
     ensure_state_dir()
     while True:
@@ -2690,9 +3067,10 @@ def menu():
         print("7) preview the action window (no automatic action)")
         print("8) lockdown: close remote access and lock the screen")
         print("9) sweep capture tools (VNC/xwd/ffmpeg; root included)")
-        print("10) exit")
+        print("10) clear browser + Discord data (guarded)")
+        print("11) exit")
         choice = ask("select> ")
-        if choice in ("10", "q", "quit", "exit"):
+        if choice in ("11", "q", "quit", "exit"):
             print("bye")
             return 0
         if choice == "1":
@@ -2736,8 +3114,591 @@ def menu():
                 auto=False))
         elif choice == "9":
             menu_action("xwatch", lambda: xwatch_command(apply=True))
+        elif choice == "10":
+            menu_clear()
         else:
             print("unknown choice\n")
+
+
+# ----------------------------------------------------------------- tray icon
+VIEWER_TIERS = {"CONFIRMED RFB SESSION", "PROBABLE", "SUSPICIOUS"}
+TRAY_ICON_IDLE = os.path.join(STATE_DIR, "tray-idle.png")
+TRAY_ICON_ACTIVE = os.path.join(STATE_DIR, "tray-active.png")
+TRAY_ICON_UNKNOWN = os.path.join(STATE_DIR, "tray-unknown.png")
+# A state.json older than this means monitoring cannot be trusted (the daemon
+# writes every ~5 s; 15 s of silence is a dead or wedged daemon).
+TRAY_STATE_MAX_AGE = int(os.environ.get("VNC_WATCH_STATE_MAX_AGE", "15"))
+
+
+def tray_state(state):
+    """(level, reason, n) from a state.json snapshot.
+
+    level is one of:
+      "active"  - concrete viewer evidence: a not-closed connection the daemon
+                  tiered as a viewer, or an ESTABLISHED socket to a watched
+                  port. Established only; a listener is NOT a viewer.
+      "idle"    - daemon healthy, no viewer (it may still be listening)
+      "unknown" - missing/unreadable state, stale timestamp, or dead daemon.
+                  Monitoring cannot be trusted, so this is never shown as idle.
+
+    Mirrors the daemon's protocol-only evidence; it never claims a human is
+    watching.
+    """
+    if state is None:
+        return "unknown", "no state (daemon not running?)", 0
+    try:
+        age = (datetime.now() - datetime.strptime(
+            state["updated"], "%Y-%m-%d %H:%M:%S")).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return "unknown", "state unreadable", 0
+    if age > TRAY_STATE_MAX_AGE:
+        return "unknown", f"state stale ({age:.0f}s old — daemon down?)", 0
+    pid = state.get("pid")
+    if not pid or not os.path.isdir(f"/proc/{pid}"):
+        return "unknown", "daemon not running", 0
+    conns = [c for c in (state.get("connections") or [])
+             if not c.get("closed") and c.get("tier") in VIEWER_TIERS]
+    if conns:
+        c = conns[-1]
+        return "active", f"{c['tier'].lower()} viewer from {c['peer']}", len(conns)
+    socks = state.get("sockets") or []
+    if socks:
+        s = socks[-1]
+        return "active", f"live :{s['port']} session from {s['peer']}", len(socks)
+    listeners = state.get("listeners") or []
+    if listeners:
+        return ("idle", "listening (" + ", ".join(f":{p}" for p in listeners)
+                + "), no viewer", 0)
+    return "idle", "monitoring, no remote viewer", 0
+
+
+def watch_active(state):
+    """Back-compat boolean view of tray_state()."""
+    level, reason, n = tray_state(state)
+    return level == "active", reason, n
+
+
+def _tray_draw_icon(path, disc, ring):
+    """Write a 64x64 ARGB PNG: a filled disc with a contrasting outer ring, so
+    the dot reads on both light and dark top bars."""
+    import cairo
+    import math
+    size = 64
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(surf)
+    cr.set_operator(cairo.OPERATOR_CLEAR)
+    cr.paint()
+    cr.set_operator(cairo.OPERATOR_OVER)
+    cx = cy = size / 2.0
+    r = size * 0.33
+    cr.arc(cx, cy, r + 3, 0, 2 * math.pi)
+    cr.set_source_rgba(*ring)
+    cr.fill()
+    cr.arc(cx, cy, r, 0, 2 * math.pi)
+    cr.set_source_rgba(*disc)
+    cr.fill()
+    surf.write_to_png(path)
+
+
+def tray_icons():
+    """{'idle','active','unknown'} -> icon path, generating PNGs if missing.
+
+    White disc = idle, red disc = a viewer is attached, grey disc = no data
+    (daemon down or state stale).
+    """
+    ensure_state_dir()
+    specs = {
+        "idle": (TRAY_ICON_IDLE, (1, 1, 1, 1), (0, 0, 0, 0.55)),
+        "active": (TRAY_ICON_ACTIVE, (0.90, 0.16, 0.16, 1), (1, 1, 1, 0.9)),
+        "unknown": (TRAY_ICON_UNKNOWN, (0.66, 0.66, 0.70, 1), (0, 0, 0, 0.55)),
+    }
+    for _k, (path, disc, ring) in specs.items():
+        try:
+            if not os.path.exists(path):
+                _tray_draw_icon(path, disc, ring)
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return {k: v[0] for k, v in specs.items()}
+
+
+def quit_browsers(timeout=8.0):
+    """Ask this user's browsers to shut down gracefully (SIGTERM only, never
+    SIGKILL), then wait. Returns {'asked': int, 'survivors': [(pid, comm)]}.
+
+    Survivors are reported, never forced. The wipe then skips any data whose
+    process is still running, so a live database is never deleted."""
+    procs = running_browsers()
+    for pid, _comm in procs:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + timeout
+    left = {pid: comm for pid, comm in procs}
+    while left and time.monotonic() < deadline:
+        left = {pid: comm for pid, comm in left.items()
+                if proc_state(pid) not in (None, "Z", "X")}
+        time.sleep(0.2)
+    return {"asked": len(procs),
+            "survivors": sorted((pid, comm) for pid, comm in left.items())}
+
+
+def _tray_confirm_wipe(parent=None):
+    """Destructive confirm. Returns (decision, quit_first) where decision is
+    True (delete), False (cancel), or None (nothing to delete)."""
+    from gi.repository import Gtk
+    items = wipe_targets()
+    if not items:
+        return None, False
+    total = sum(_size_of(p) for _l, p, _k in items)
+    dlg = Gtk.MessageDialog(transient_for=parent, modal=True,
+                            message_type=Gtk.MessageType.WARNING,
+                            buttons=Gtk.ButtonsType.NONE)
+    dlg.set_title("Clear browser + Discord data")
+    dlg.set_markup("<b>Delete browser data and Discord storage?</b>")
+    dlg.format_secondary_text(
+        f"{len(items)} item(s), about {total / 1048576:.1f} MB — history, "
+        f"downloads, cookies, sessions, caches, autofill, and saved logins "
+        f"across Firefox, Chrome, Chromium, Brave, Edge, Vivaldi and Opera, "
+        f"plus Discord storage. Bookmarks are kept. This logs you out of "
+        f"sites and Discord and cannot be undone.")
+    dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+    dlg.add_button("Delete now", Gtk.ResponseType.OK)
+    dlg.set_default_response(Gtk.ResponseType.CANCEL)
+    chk = Gtk.CheckButton.new_with_label(
+        "Quit running browsers first (recommended)")
+    chk.set_active(True)
+    dlg.get_content_area().add(chk)
+    dlg.show_all()
+    resp = dlg.run()
+    quit_first = chk.get_active()
+    dlg.destroy()
+    return resp == Gtk.ResponseType.OK, quit_first
+
+
+def _wipe_and_summary(quit_first):
+    """Run the wipe synchronously. Returns (parts, quit, result).
+
+    Kept separate from _tray_do_wipe so a one-shot `clear` process can run it
+    to completion instead of relying on a thread that dies with the process."""
+    q = (quit_browsers() if quit_first
+         else {"asked": 0, "survivors": []})
+    res = wipe_private_data(apply=True)
+    parts = [f"Cleared {len(res['items'])} item(s), "
+             f"{res['total'] / 1048576:.1f} MB"]
+    if q["asked"]:
+        parts.append(f"asked {q['asked']} browser proc(s) to quit")
+    if q["survivors"]:
+        parts.append(f"{len(q['survivors'])} refused to exit — their "
+                     f"data was skipped")
+    if res["skipped"]:
+        parts.append(f"{len(res['skipped'])} skipped (app running)")
+    if res["errors"]:
+        parts.append(f"{len(res['errors'])} error(s)")
+    return parts, q, res
+
+
+def _tray_do_wipe(quit_first):
+    def work():
+        try:
+            parts, q, res = _wipe_and_summary(quit_first)
+            notify("vnc-watch", "; ".join(parts), "viewer",
+                   urgent=bool(q["survivors"] or res["errors"]))
+        except Exception as exc:
+            notify("vnc-watch", f"clear failed: {exc}", "viewer")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def clear_command():
+    """One-shot `clear`: guard, confirm (GTK), then wipe to completion.
+
+    The panel/GNOME extension spawns this as its own process, so the work must
+    finish before the process exits — no fire-and-forget thread here."""
+    locked, why = active_lock_window()
+    if locked:
+        msg = f"clear refused: {why} (exam/lock window active)"
+        notify("vnc-watch", msg, "viewer")
+        print(msg, flush=True)
+        return 1
+    ok, quit_first = _tray_confirm_wipe()
+    if ok is None:
+        msg = "nothing to clear (no browser or Discord data found)"
+        notify("vnc-watch", msg, "viewer", urgent=False)
+        print(msg, flush=True)
+        return 0
+    if not ok:
+        print("cancelled", flush=True)
+        return 1
+    try:
+        parts, q, res = _wipe_and_summary(quit_first)
+    except Exception as exc:
+        notify("vnc-watch", f"clear failed: {exc}", "viewer")
+        print(f"clear failed: {exc}", flush=True)
+        return 2
+    msg = "; ".join(parts)
+    notify("vnc-watch", msg, "viewer",
+           urgent=bool(q["survivors"] or res["errors"]))
+    print(msg, flush=True)
+    return 0
+
+
+def _tray_clear():
+    locked, why = active_lock_window()
+    if locked:
+        notify("vnc-watch", f"clear refused: {why} (exam/lock window active)",
+               "viewer")
+        return
+    ok, quit_first = _tray_confirm_wipe()
+    if ok is None:
+        notify("vnc-watch", "nothing to clear (no browser or Discord data found)",
+               "viewer", urgent=False)
+        return
+    if ok:
+        _tray_do_wipe(quit_first)
+
+
+def _tray_ask(title, markup, detail):
+    from gi.repository import Gtk
+    d = Gtk.MessageDialog(message_type=Gtk.MessageType.QUESTION,
+                          buttons=Gtk.ButtonsType.OK_CANCEL)
+    d.set_title(title)
+    d.set_markup(markup)
+    d.format_secondary_text(detail)
+    ok = d.run() == Gtk.ResponseType.OK
+    d.destroy()
+    return ok
+
+
+def kick_command():
+    """One-shot panel `kick`: confirm in a dialog, then close to completion.
+
+    The CLI `kick` path prompts on stdin; from the panel there is no tty, so
+    this variant confirms with the same GTK dialog the tray menu uses."""
+    locked, why = active_lock_window()
+    if locked:
+        msg = f"kick refused: {why} (exam/lock window active)"
+        notify("vnc-watch", msg, "viewer")
+        print(msg, flush=True)
+        return 1
+    if not _tray_ask("Close VNC server", "<b>Close any running VNC server?</b>",
+                     "This drops every viewer. X11 has no per-viewer "
+                     "disconnect; a root operator can restart it."):
+        print("cancelled", flush=True)
+        return 1
+    try:
+        rc = run_close_vnc(assume_yes=True)
+        notify("vnc-watch", f"close VNC finished (rc={rc})", "viewer",
+               urgent=False)
+        print(f"close VNC finished (rc={rc})", flush=True)
+        return rc
+    except Exception as exc:
+        notify("vnc-watch", f"close VNC failed: {exc}", "viewer")
+        print(f"close VNC failed: {exc}", flush=True)
+        return 2
+
+
+def _tray_kick():
+    locked, why = active_lock_window()
+    if locked:
+        notify("vnc-watch", f"kick refused: {why} (exam/lock window active)",
+               "viewer")
+        return
+    if not _tray_ask("Close VNC server", "<b>Close any running VNC server?</b>",
+                     "This drops every viewer. X11 has no per-viewer "
+                     "disconnect; a root operator can restart it."):
+        return
+    def work():
+        try:
+            rc = run_close_vnc(assume_yes=True)
+            notify("vnc-watch", f"close VNC finished (rc={rc})", "viewer",
+                   urgent=False)
+        except Exception as exc:
+            notify("vnc-watch", f"close VNC failed: {exc}", "viewer")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def lock_command():
+    """One-shot `lock`: lock the session and report the outcome."""
+    try:
+        ok, how = lock_session()
+    except Exception as exc:
+        ok, how = False, str(exc)
+    msg = f"{'locked' if ok else 'lock failed'}: {how}"
+    notify("vnc-watch", msg, "viewer", urgent=False)
+    print(msg, flush=True)
+    return 0 if ok else 1
+
+
+def _tray_lock():
+    lock_command()
+
+
+def _tray_open_menu():
+    argv = [sys.executable, os.path.abspath(__file__), "menu"]
+    term = (shutil.which("gnome-terminal") or shutil.which("kgx")
+            or shutil.which("x-terminal-emulator") or shutil.which("xterm"))
+    if term and "gnome-terminal" in term:
+        cmd = [term, "--", *argv]
+    elif term and "kgx" in term:
+        cmd = [term, "--", *argv]
+    elif term:
+        cmd = [term, "-e", *argv]
+    else:
+        cmd = argv
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as exc:
+        notify("vnc-watch", f"cannot open menu: {exc}", "viewer")
+
+
+def menu_window_command():
+    """One-shot `menu-window`: open the interactive menu in a terminal."""
+    _tray_open_menu()
+    return 0
+
+
+def _tray_quit():
+    from gi.repository import Gtk
+    Gtk.main_quit()
+
+
+def _tray_menu():
+    """The click menu shared by both tray backends. Returns (menu, status)."""
+    from gi.repository import Gtk
+    menu = Gtk.Menu()
+    status = Gtk.MenuItem(label="vnc-watch: starting…")
+    status.set_sensitive(False)
+    menu.append(status)
+    menu.append(Gtk.SeparatorMenuItem())
+
+    def item(label, fn):
+        it = Gtk.MenuItem(label=label)
+        it.connect("activate", lambda _w: fn())
+        menu.append(it)
+
+    item("Open vnc-watch menu…", _tray_open_menu)
+    item("Clear browser + Discord data…", _tray_clear)
+    menu.append(Gtk.SeparatorMenuItem())
+    item("Close VNC server (kick)", _tray_kick)
+    item("Lock session", _tray_lock)
+    menu.append(Gtk.SeparatorMenuItem())
+    item("Quit tray", _tray_quit)
+    menu.show_all()
+    return menu, status
+
+
+def _appindicator_ready():
+    """True if the top-bar indicator will actually be shown.
+
+    On GNOME it needs the `appindicatorsupport` shell extension ENABLED; if
+    that extension is missing or off (e.g. locked by a dconf policy), an
+    AppIndicator is created but never rendered, so we fall back to the floating
+    chip. On non-GNOME desktops the indicator is assumed to work."""
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+    if "gnome" not in desktop and "unity" not in desktop:
+        return True
+    for uuid in ("appindicatorsupport@rgcjonas.gmail.com",
+                 "ubuntu-appindicators@ubuntu.com"):
+        try:
+            r = subprocess.run(["gnome-extensions", "info", uuid],
+                               capture_output=True, text=True, timeout=4)
+            if "State: ENABLED" in r.stdout:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return False
+
+
+def _tray_poll(status, on_change):
+    """One poll cycle: read state, update the status label, and fire
+    on_change(level, reason, n) only when the level flips.
+
+    Levels: active | idle | unknown. `unknown` is used whenever the daemon's
+    state is missing, unreadable, stale, or its pid is dead — never idle."""
+    level, reason, n = tray_state(read_json(STATE_FILE))
+    mark = {"active": "●", "idle": "○", "unknown": "?"}[level]
+    status.set_label(f"{mark} {reason}")
+    if level != _tray_poll.last:
+        _tray_poll.last = level
+        on_change(level, reason, n)
+    return True
+
+
+def _tray_indicator(icons):
+    """Top-bar AppIndicator. Returns True if set up (not whether it renders)."""
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import GLib
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+
+    ind = AppIndicator.Indicator.new(
+        "vnc-watch", icons["unknown"],
+        AppIndicator.IndicatorCategory.SYSTEM_SERVICES)
+    ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
+    def set_icon(path):
+        try:
+            ind.set_icon_full(path, "vnc-watch")
+        except Exception:
+            ind.set_icon(path)
+
+    set_icon(icons["unknown"])              # unknown until first poll
+    menu, status = _tray_menu()
+    ind.set_menu(menu)
+
+    def on_change(level, *_):
+        set_icon(icons[level])
+
+    _tray_poll.last = None
+    GLib.timeout_add(1500, lambda: _tray_poll(status, on_change))
+    _tray_poll(status, on_change)
+    return True
+
+
+def _tray_floating(icons):
+    """No-root fallback: a small always-on-top chip at the top edge, styled
+    like a panel button. Left-click opens the same menu. Position via
+    VNC_WATCH_TRAY_X / VNC_WATCH_TRAY_Y (defaults: top-right, under the panel)."""
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, GLib, Gdk
+
+    menu, status = _tray_menu()
+
+    win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    win.set_decorated(False)
+    win.set_resizable(False)
+    win.set_skip_taskbar_hint(True)
+    win.set_skip_pager_hint(True)
+    win.set_keep_above(True)
+    win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+    win.set_title("vnc-watch")
+
+    css = Gtk.CssProvider()
+    css.load_from_data((
+        ".vncwatch-chip { background: rgba(18,18,22,0.86);"
+        " border-radius: 13px; }"
+        " .vncwatch-chip label { color: #f4f4f5; }").encode())
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), css,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+    dot = Gtk.DrawingArea()
+    dot.set_size_request(16, 16)
+    lbl = Gtk.Label(label="vnc-watch")
+    box.pack_start(dot, False, False, 0)
+    box.pack_start(lbl, False, False, 0)
+    eb = Gtk.EventBox()
+    eb.get_style_context().add_class("vncwatch-chip")
+    eb.set_margin_top(5)
+    eb.set_margin_bottom(5)
+    eb.set_margin_start(11)
+    eb.set_margin_end(12)
+    eb.add(box)
+    win.add(eb)
+
+    COLORS = {"idle": (1.0, 1.0, 1.0),
+              "active": (0.92, 0.16, 0.16),
+              "unknown": (0.66, 0.66, 0.70)}
+    color = {"rgb": COLORS["unknown"]}      # grey until first poll
+
+    def draw(_w, cr):
+        r, g, b = color["rgb"]
+        cr.set_source_rgba(1, 1, 1, 0.0)
+        cr.paint()
+        cr.set_source_rgb(r, g, b)
+        cr.arc(8, 8, 6, 0, 6.283185307179586)
+        cr.fill()
+    dot.connect("draw", draw)
+
+    def on_click(_w, event):
+        menu.popup_at_pointer(event)
+        return True
+    eb.connect("button-press-event", on_click)
+
+    def place():
+        disp = Gdk.Display.get_default()
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        sw = mon.get_geometry().width
+        w, _h = win.get_size()
+        try:
+            x = int(os.environ["VNC_WATCH_TRAY_X"])
+        except (KeyError, ValueError):
+            x = sw - w - 14
+        try:
+            y = int(os.environ["VNC_WATCH_TRAY_Y"])
+        except (KeyError, ValueError):
+            y = 32
+        win.move(x, y)
+
+    win.connect("show", lambda _w: place())
+
+    def on_change(level, reason, _n):
+        color["rgb"] = COLORS[level]
+        dot.queue_draw()
+        prefix = {"active": "WATCHING", "idle": "Idle",
+                  "unknown": "UNKNOWN"}[level]
+        win.set_tooltip_text(f"{prefix} — {reason}")
+
+    _tray_poll.last = None
+    win.show_all()
+    GLib.idle_add(place)
+    GLib.timeout_add(1500, lambda: _tray_poll(status, on_change))
+    _tray_poll(status, on_change)
+    # re-place if the panel/screen changes
+    try:
+        Gdk.Display.get_default().connect(
+            "monitor-changed", lambda *_: (place(), False)[1])
+    except Exception:
+        pass
+    return True
+
+
+def tray_command(backend=None):
+    """Tray icon: white = idle, red = viewer attached, grey = unknown.
+
+    Reads the daemon's state.json and recolors. Clicking opens a menu: open
+    the full menu, clear browser + Discord data (destructive, with a
+    confirmation dialog), close a running VNC server, lock the session, quit.
+
+    Uses the GNOME top-bar indicator when the AppIndicator shell extension is
+    enabled; otherwise falls back to a docked always-on-top chip at the top
+    edge (no root or shell extension required). Force with
+    VNC_WATCH_TRAY_BACKEND=indicator|floating or `--tray-backend`.
+    """
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk
+
+    ensure_state_dir()
+    icons = tray_icons()
+    backend = (backend or os.environ.get("VNC_WATCH_TRAY_BACKEND")
+               or "").strip().lower()
+
+    used = "floating"
+    if backend == "indicator" or (backend != "floating"
+                                  and _appindicator_ready()):
+        try:
+            _tray_indicator(icons)
+            used = "indicator"
+        except Exception as exc:            # missing typelib, no DBus, ...
+            print(f"indicator unavailable ({exc}); using floating chip",
+                  flush=True)
+    if used == "floating":
+        _tray_floating(icons)
+
+    print(f"tray running ({used}) — white = idle, red = viewer, grey = unknown "
+          f"(Ctrl-C to stop)", flush=True)
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 # --------------------------------------------------------------------- cli
@@ -2748,9 +3709,10 @@ def main():
     ap.add_argument("command", nargs="?",
                     choices=["watch", "audit", "portal", "kick", "popup",
                              "channels", "lockdown", "shortcut", "xwatch",
-                             "menu"],
+                             "tray", "menu", "menu-window", "clear", "lock"],
                     help="watch (default), audit, portal, kick, popup, "
-                         "channels, lockdown, shortcut, xwatch, menu")
+                         "channels, lockdown, shortcut, xwatch, tray, menu, "
+                         "menu-window, clear, lock")
     ap.add_argument("--audit", action="store_true",
                     help="alias for `audit`")
     ap.add_argument("--portal", action="store_true",
@@ -2761,6 +3723,9 @@ def main():
                     help="watch X client count (noisy, off by default)")
     ap.add_argument("--yes", action="store_true",
                     help="with `kick`: skip the interactive confirmation")
+    ap.add_argument("--panel", action="store_true",
+                    help="with `kick`: confirm in a GTK dialog instead of on "
+                         "stdin (used by the top-panel menu; no tty there)")
     ap.add_argument("--dry-run", action="store_true",
                     help="with `kick`: report the target, change nothing")
     ap.add_argument("--reason", default="Remote viewing detected",
@@ -2780,6 +3745,9 @@ def main():
     ap.add_argument("--no-lock", action="store_true",
                     help="with `lockdown`: close remote access but do not "
                          "lock the screen")
+    ap.add_argument("--tray-backend", choices=["indicator", "floating"],
+                    help="with `tray`: force the top-bar indicator or the "
+                         "floating chip")
     ap.add_argument("--remove", action="store_true",
                     help="with `shortcut`: remove the hotkey")
     ap.add_argument("--binding", default="<Control><Alt><Shift>l",
@@ -2799,6 +3767,8 @@ def main():
         return portal_status()
     if cmd == "kick":
         ensure_state_dir()
+        if args.panel:
+            return kick_command()
         return run_close_vnc(assume_yes=args.yes, apply=not args.dry_run)
     if cmd == "popup":
         ensure_state_dir()
@@ -2815,8 +3785,18 @@ def main():
     if cmd == "xwatch":
         ensure_state_dir()
         return xwatch_command(apply=not args.dry_run, assume_yes=args.yes)
+    if cmd == "tray":
+        return tray_command(backend=args.tray_backend)
     if cmd == "menu":
         return menu()
+    if cmd == "menu-window":
+        return menu_window_command()
+    if cmd == "clear":
+        ensure_state_dir()
+        return clear_command()
+    if cmd == "lock":
+        ensure_state_dir()
+        return lock_command()
     return follow_live(args)
 
 

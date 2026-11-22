@@ -1,0 +1,8 @@
+{
+    "uuid": "vnc-watch@local",
+    "name": "vnc-watch status",
+    "description": "Top-panel status for the vnc-watch remote-viewing detector. White dot = idle, red = viewer attached, grey = monitoring unavailable.",
+    "shell-version": ["42"],
+    "session-modes": ["user", "ubuntu"],
+    "version": 1
+}

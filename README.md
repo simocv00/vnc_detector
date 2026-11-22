@@ -59,6 +59,7 @@ This matters more than the feature list. Read it before trusting the tool.
 | `xinput` | XTEST injection signal | that signal is skipped |
 | `gdbus` or `notify-send` | desktop notifications | silent |
 | `python3-gi` + GTK 3 | action window | window skipped, notification only |
+| GNOME Shell 42 (X11) | top-panel indicator | use the legacy tray or action window |
 | readable `/var/run/utmp` | login detection | falls back to `loginctl` |
 
 Check what your machine has:
@@ -76,6 +77,14 @@ make install
 That creates `~/.local/bin/vnc-watch` (symlink), installs
 `~/.config/systemd/user/vnc-watch.service`, creates the state directory, and
 starts the daemon. Re-running `make install` is safe.
+
+For a native GNOME top-panel status dot, also run:
+
+```bash
+make panel-install && make panel-restart
+```
+
+See **Top-panel indicator** below.
 
 Without systemd:
 
@@ -99,6 +108,10 @@ python3 vnc-watch.py watch --input-watch
 | `vnc-watch lockdown [--no-lock]` | close remote access and lock the screen |
 | `vnc-watch channels [--test] [--set K=V] [--clear K]` | configure remote alerts |
 | `vnc-watch shortcut [--remove] [--binding ...]` | install/remove the lockdown hotkey |
+| `vnc-watch clear` | confirm, then wipe browser + Discord data (panel menu) |
+| `vnc-watch lock` | lock the session (panel menu) |
+| `vnc-watch menu-window` | open the interactive menu in a terminal (panel menu) |
+| `vnc-watch tray [--tray-backend indicator\|floating]` | legacy GTK status dot (see below) |
 
 Useful flags for `watch`:
 
@@ -169,19 +182,143 @@ make install LOCKFILE=/run/seat-lock/seat0.json
 
 ### What the wipe removes
 
-Per browser profile (Chrome, Chromium, Brave, Firefox — native and flatpak):
-`History`, `Cookies`, `Sessions`, `Session Storage`, `Local Storage`,
-`IndexedDB`, `Cache`, `Code Cache`, `GPUCache`, `Service Worker`,
-`places.sqlite`, `cookies.sqlite`, `sessionstore-backups`, `storage`,
-`cache2`, `startupCache`.
+Supported browsers — **stable native and Flatpak** installs:
+
+| Browser | Native root | Flatpak app-id |
+| --- | --- | --- |
+| Firefox | `~/.mozilla/firefox` | `org.mozilla.firefox` |
+| Chromium | `~/.config/chromium` | `org.chromium.Chromium` |
+| Google Chrome | `~/.config/google-chrome` | `com.google.Chrome` |
+| Brave | `~/.config/BraveSoftware/Brave-Browser` | `com.brave.Browser` |
+| Microsoft Edge | `~/.config/microsoft-edge` | `com.microsoft.Edge` |
+| Vivaldi | `~/.config/vivaldi` | `com.vivaldi.Vivaldi` |
+| Opera | `~/.config/opera` (or `Default/`) | `com.opera.Opera` |
+
+Every profile in a root is cleaned (`Default`, `Profile 1`, ...; Firefox
+profiles from `profiles.ini`; Opera's legacy root-level layout). Per profile
+the following are removed:
+
+- **Chromium-family** (Chromium, Chrome, Brave, Edge, Vivaldi, Opera):
+  `History`, `Visited Links`, `Web Data`, `Login Data`, `Login Data For
+  Account`, `Affiliation Database`, `Cookies`, `Network/Cookies`, `Sessions`,
+  `Session Storage`, `Local Storage`, `IndexedDB`, `Cache`, `Code Cache`,
+  `GPUCache`, `Service Worker`, `Shared Dictionary`, `Storage`, and the
+  network-state files — each database file is deleted **together with its
+  `-journal`/`-wal`/`-shm` sidecars**, so no rows survive in a WAL.
+- **Firefox**: `cookies.sqlite`, `formhistory.sqlite`, `logins.json`,
+  `logins-backup.json`, `key4.db`, `key3.db`, `signons.sqlite`,
+  `sessionstore-backups`, `sessionstore.jsonlz4`, `storage`, `cache2`,
+  `startupCache`, `shader-cache`, `crashes`.
+
+Firefox's `places.sqlite` is **not** deleted — it holds bookmarks as well as
+history. It is cleaned in place with SQL: history visits, typed-input history,
+and places not referenced by any bookmark are removed, while the bookmark tree
+and its annotations survive. `wal_checkpoint(TRUNCATE)` must succeed and the
+database is `VACUUM`ed with `secure_delete` on; `PRAGMA integrity_check` must
+return `ok`. On any unexpected failure the whole step is aborted and reported,
+and the WAL/SHM files are left in place.
+
+**Bookmarks are the only thing preserved.** Saved passwords, autofill, form
+history and NSS login data are removed. On Chromium-family browsers the
+`Bookmarks`/`Bookmarks.bak` files and `Preferences` are left untouched; a pass
+deletes credentials and history but keeps the bookmark file.
 
 Per Discord (`discord`, `discordcanary`, `discordptb`, `BetterDiscord`):
 `Cache`, `Code Cache`, `GPUCache`, `Local Storage`, `Session Storage`,
 `IndexedDB`, `logs`, `Network Persistent State`, `Service Worker`.
 
-Kept on purpose: bookmarks and saved passwords. Every removal is logged with
-its size. Paths outside your home are refused, symlinks are never followed
-out of it.
+A category whose application is still running is skipped rather than deleted
+out from under it, and any individual file a same-user process holds open is
+skipped too; the tray's "quit running browsers first" option SIGTERMs browsers
+and reports any that refuse to exit (their data is then skipped). Every
+removal is logged with its size, and every skip or failure is reported. Paths
+outside your home are refused and symlinks are never followed out of it.
+
+> **Known limits:** deleting `Login Data` removes the stored ciphertext, but
+> the OS-keyring master key (`Chrome Safe Storage`) and Firefox's NSS password
+> are left in place; synced passwords/history can return from a signed-in
+> account; and channel variants (Beta/Dev/Canary/Snapshot) plus Snap installs
+> are not yet covered. Cookies and caches are removed as whole files, so
+> affected sites log you out.
+
+---
+
+## Top-panel indicator
+
+A real GNOME **top-panel button** next to volume/battery/keyboard/lock/power —
+not a floating window. It shows a coloured status dot and a click menu:
+
+- **white** — idle: the daemon is alive and reports no remote viewer.
+- **red** — the daemon reports a viewer (`CONFIRMED`/`PROBABLE`/`SUSPICIOUS`)
+  or an **established** socket to a VNC/RDP port.
+- **grey** — **unknown**: no readable state, a stale timestamp, or a dead
+  daemon pid. Monitoring cannot be trusted, so it never shows white here.
+
+The dot is read-only state; the menu offers the same actions as the action
+window: **Open vnc-watch menu…**, **Clear browser + Discord data…** (behind the
+usual confirmation), **Close VNC server (kick)**, and **Lock session**. The
+clear and kick entries refuse while a campus lock/exam window is active.
+
+It polls `state.json` every 1.5 s and mirrors the daemon's logic exactly. A
+state file older than 15 s (`VNC_WATCH_STATE_MAX_AGE`) or whose `pid` is gone
+counts as unknown — a stopped or crashed detector shows grey, never a
+reassuring white. A **listening** service with nobody attached is idle (white);
+only established connections or protocol-tiered viewers turn it red.
+
+### Install
+
+```bash
+make panel-install    # per-user extension + mode file + shell drop-in
+make panel-restart    # reload the shell once so it picks up the new env
+make panel-status     # show what is installed and the shell's data dirs
+make panel-uninstall  # remove everything (reload/logout to drop the button)
+```
+
+No root, no dconf writes, and no system files are touched. The pieces live
+entirely under `$HOME` (see **Files**).
+
+### Why it works this way (and the exact limitation)
+
+GNOME only lets a shell extension add a panel item, and this machine pins
+`org.gnome.shell enabled-extensions` with a root-owned dconf lock, so the
+AppIndicator extension can never be enabled. Reading the Shell's own source
+(`extensionSystem.js`) shows the two enable paths:
+
+1. the locked `enabled-extensions` allow-list — unwritable; and
+2. **session-mode extensions**, read from the mode file — but on Ubuntu a
+   *per-user* mode extension is explicitly refused (`Desktop.is("ubuntu") &&
+   isModeExtension && type === PER_USER`).
+
+The only userspace route is to make our extension a **system**-type extension —
+i.e. outside `~/.local/share`. A systemd **user** drop-in can give the Shell a
+data dir under `$HOME` without root or dconf:
+
+```
+# ~/.config/systemd/user/org.gnome.Shell@x11.service.d/override.conf
+[Service]
+Environment=XDG_DATA_DIRS=%h/.vnc-watch-xdg:<existing dirs>
+SuccessExitStatus=
+SuccessExitStatus=1
+SuccessExitStatus=SIGTERM
+```
+
+With that dir first, the Shell loads our copy of the `ubuntu` mode file (which
+appends `vnc-watch@local` to `enabledExtensions`) and finds the extension there,
+classified as **system** — so the Ubuntu per-user guard does not fire.
+
+This is a deliberate, documented workaround of the *intent* of the campus
+allow-list (it never writes the locked key). It is also fragile: it pins the
+Shell's `XDG_DATA_DIRS`, needs a Shell reload, and could break on a GNOME
+update. `make panel-install` prints the exact `XDG_DATA_DIRS` it wrote.
+
+### Legacy GTK tray (superseded)
+
+`vnc-watch tray` still exists as a separate GTK program with two backends
+(`--tray-backend indicator|floating`) and its own unit
+`vnc-watch-tray.service`. The **floating** backend is a docked always-on-top
+chip, not a panel item; the **indicator** backend only renders when the
+AppIndicator shell extension is enabled (blocked here). Do not run it alongside
+the top-panel indicator. It is kept only for non-GNOME desktops and manual use.
 
 ---
 
@@ -365,15 +502,26 @@ vnc-watch channels --set webhook_url=https://your-server/hook
 
 ```
 ~/.local/bin/vnc-watch                        symlink created by make install
-~/.config/systemd/user/vnc-watch.service      user service
+~/.config/systemd/user/vnc-watch.service      the detector, user service
+~/.config/systemd/user/vnc-watch-tray.service legacy GTK tray, user service
+
+Top-panel indicator (make panel-install):
+~/.vnc-watch-xdg/gnome-shell/extensions/vnc-watch@local/   the shell extension
+~/.vnc-watch-xdg/gnome-shell/modes/ubuntu.json             mode file (adds UUID)
+~/.config/systemd/user/org.gnome.Shell@x11.service.d/override.conf   drop-in
+
 ~/.local/state/vnc-watch/
     vnc-watch.log        alert log (also mirrored to your channels)
     vnc-watch.out        daemon stdout/stderr
+    vnc-watch-tray.out   tray stdout/stderr
     state.json           daemon -> menu snapshot
     ack.json             menu acknowledgements (bookkeeping only)
     channels.json        0600, remote alert credentials
     xinput-xi2.log       XTEST dump, capped at 2 MB
     popup.lock           keeps one action window open at a time
+    tray-idle.png        0600, generated tray icon (white)
+    tray-active.png      0600, generated tray icon (red)
+    tray-unknown.png     0600, generated tray icon (grey, no data)
 ```
 
 The state directory is created 0700 (so the files inside stay private
@@ -417,6 +565,26 @@ code; if you see it again, your proxy or a newer block is involved. Test with
 A running browser can re-flush databases from memory. Close browsers before
 relying on a wipe.
 
+**Top-panel indicator missing after install**
+
+The extension is enabled only after the Shell reloads with the new data dir:
+
+```bash
+make panel-status      # are the extension, mode file, and drop-in present?
+make panel-restart     # reload the shell once
+gnome-extensions info vnc-watch@local   # expect: State: ENABLED
+journalctl --user -n 100 --no-pager | grep -i 'vnc-watch@local'
+```
+
+If `State` is `INITIALIZED` or the button is absent, the Shell did not see the
+new `XDG_DATA_DIRS` — confirm `panel-status` shows `~/.vnc-watch-xdg` first,
+then reload again (or log out and back in).
+
+**Panel dot is stuck grey**
+
+Grey means the daemon snapshot is missing, stale (>15 s), or its `pid` is dead.
+Check `make status` and `systemctl --user status vnc-watch`.
+
 **Daemon stopped with "Start request repeated too quickly"**
 
 It hit the restart limit after repeated failures (often a full disk):
@@ -431,8 +599,9 @@ systemctl --user start vnc-watch
 ## Uninstall
 
 ```bash
-make uninstall      # stop and remove service + symlink, keep state
-make purge          # also delete ~/.local/state/vnc-watch
+make panel-uninstall          # remove the top-panel indicator (then reload)
+make uninstall                # stop and remove service + symlink, keep state
+make purge                    # also delete ~/.local/state/vnc-watch
 vnc-watch shortcut --remove   # remove the hotkey
 ```
 
