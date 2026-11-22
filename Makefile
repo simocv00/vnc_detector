@@ -38,7 +38,8 @@ TRAYBACKEND ?=
 .PHONY: help check install uninstall status logs restart stop start \
         channels test test-fixtures test-ssh popup-test shortcut lockdown \
         xwatch audit ssh menu run tray tray-stop clean purge panel-install \
-        panel-uninstall panel-restart panel-status
+        panel-uninstall panel-restart panel-status units update reload \
+        panel-refresh
 
 help:
 	@echo "vnc-watch"
@@ -50,6 +51,8 @@ help:
 	@echo "  make status       service state and configured alert channels"
 	@echo "  make logs         tail the alert log"
 	@echo "  make restart      restart the detection daemon"
+	@echo "  make update       git pull, then restart every running piece"
+	@echo "  make reload       restart every running piece (no pull)"
 	@echo ""
 	@echo "  make shortcut     bind Ctrl+Alt+Shift+L to lockdown"
 	@echo "  make channels     show/edit remote alert channels"
@@ -92,11 +95,26 @@ check:
 	@test -r /var/log/wtmp && echo "ssh wtmp: readable" || echo "ssh wtmp: not readable (remote-login history off)"
 	@test -r /var/log/auth.log && echo "ssh auth: auth.log readable (login method visible)" || echo "ssh auth: auth.log not readable (needs adm; method/key not read)"
 
-install: check
+install: check units
 	@mkdir -p "$(BINDIR)" "$(STATE)"
 	@chmod 700 "$(STATE)"
 	@ln -sfn "$(CURDIR)/$(SRC)" "$(LINK)"
 	@echo "link    : $(LINK) -> $(CURDIR)/$(SRC)"
+	@if command -v systemctl >/dev/null 2>&1; then \
+		systemctl --user daemon-reload && \
+		systemctl --user enable $(SERVICE) >/dev/null 2>&1; \
+		systemctl --user restart $(SERVICE) && echo "service : started"; \
+		systemctl --user disable --now $(TRAYSERVICE) >/dev/null 2>&1 || true; \
+		echo "tray    : legacy, not started. For the top-panel dot run 'make panel-install'"; \
+	else \
+		echo "service : systemd not available, start with: $(LINK) watch --input-watch"; \
+		echo "panel   : install the GNOME top-panel dot with 'make panel-install'"; \
+	fi
+	@$(MAKE) --no-print-directory status
+
+# Generate the systemd user units from the templates. Split out so 'make update'
+# can re-apply unit changes after a pull without redoing the whole install.
+units:
 	@mkdir -p "$(UNITDIR)"
 	@sed -e 's|@PYTHON@|$(PYTHON)|g' \
 	     -e 's|@EXEC@|$(LINK)|g' \
@@ -111,17 +129,6 @@ install: check
 	     -e 's|@TRAYBACKEND@|$(TRAYBACKEND)|g' \
 	     packaging/vnc-watch-tray.service.in > "$(TRAYUNIT)"
 	@echo "unit    : $(TRAYUNIT)"
-	@if command -v systemctl >/dev/null 2>&1; then \
-		systemctl --user daemon-reload && \
-		systemctl --user enable $(SERVICE) >/dev/null 2>&1; \
-		systemctl --user restart $(SERVICE) && echo "service : started"; \
-		systemctl --user disable --now $(TRAYSERVICE) >/dev/null 2>&1 || true; \
-		echo "tray    : legacy, not started. For the top-panel dot run 'make panel-install'"; \
-	else \
-		echo "service : systemd not available, start with: $(LINK) watch --input-watch"; \
-		echo "panel   : install the GNOME top-panel dot with 'make panel-install'"; \
-	fi
-	@$(MAKE) --no-print-directory status
 
 uninstall:
 	@if command -v systemctl >/dev/null 2>&1; then \
@@ -157,6 +164,33 @@ logs:
 
 restart:
 	@systemctl --user restart $(SERVICE) 2>/dev/null || $(LINK) watch --input-watch
+
+# After 'git pull': the daemon runs the symlinked source, so the file on disk
+# changes but the running process keeps the old code. This pulls the latest
+# code, re-applies the systemd units, restarts the daemon and refreshes the
+# panel indicator — one button, everything back on the new code.
+update:
+	@git pull --ff-only || { echo "update  : git pull failed; fix the tree, then run 'make reload'"; exit 1; }
+	@$(MAKE) --no-print-directory reload
+
+# Bring every running piece onto the current working tree: units, daemon, tray,
+# panel. Safe to run any time; parts that are not installed are skipped.
+reload: units
+	@if command -v systemctl >/dev/null 2>&1; then \
+		systemctl --user daemon-reload; \
+		if systemctl --user is-active --quiet $(SERVICE); then \
+			systemctl --user restart $(SERVICE) && echo "daemon  : restarted"; \
+		else echo "daemon  : not active (start it with 'make start')"; fi; \
+		systemctl --user try-restart $(TRAYSERVICE) >/dev/null 2>&1 || true; \
+	else \
+		echo "daemon  : systemd unavailable; restart '$(LINK) watch --input-watch' by hand"; \
+	fi
+	@sh packaging/install-panel.sh refresh
+
+# Re-sync the installed panel extension from the repo and reload the shell only
+# if the files actually changed. No-op when the panel was never installed.
+panel-refresh:
+	@sh packaging/install-panel.sh refresh
 
 stop:
 	@systemctl --user stop $(SERVICE) 2>/dev/null || true

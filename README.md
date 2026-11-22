@@ -86,6 +86,19 @@ make panel-install && make panel-restart
 
 See **Top-panel indicator** below.
 
+After updating the code (a `git pull`), bring every running piece onto it:
+
+```bash
+make update
+```
+
+`make update` pulls with `--ff-only`, re-applies the systemd user units,
+restarts the daemon, and re-syncs the panel indicator — reloading the shell
+only if the extension actually changed. Nothing new takes effect otherwise,
+because the running daemon keeps the code it loaded at startup. If the code is
+already on disk (you pulled by hand, or update failed on a dirty tree), run
+`make reload` to restart everything without pulling.
+
 Without systemd:
 
 ```bash
@@ -144,7 +157,8 @@ VNC/RDP tiers above, never changes `REMOTE_PORTS`, and leaves all existing VNC
 detection untouched. Everything here runs unprivileged.
 
 Event kinds: `ssh-session`, `ssh-connection`, `outbound`, `ssh-command`,
-`ssh-x11vnc`, `ssh-daemon`, `ssh-history`, `ssh-keychange`.
+`ssh-session-activity`, `ssh-x11vnc`, `ssh-daemon`, `ssh-history`,
+`ssh-keychange`.
 
 ### Evidence ladder
 

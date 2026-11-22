@@ -6,7 +6,7 @@
 # *system* data dir. It never writes dconf, never edits a system file, and
 # never needs root. See README "Top-panel indicator (Plan B)" for the why.
 #
-# Usage: install-panel.sh [install|uninstall|restart|status]
+# Usage: install-panel.sh [install|uninstall|restart|refresh|status]
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -106,6 +106,24 @@ do_restart() {
     die "shell did not come back within 20s; check 'systemctl --user status org.gnome.Shell@x11.service'"
 }
 
+# Re-sync the installed extension from the repo. Reload the shell only when a
+# file actually changed, so an update with no panel changes does not redraw.
+do_refresh() {
+    if [ ! -f "$extdir/extension.js" ]; then
+        echo "panel   : not installed (run 'make panel-install')"
+        return 0
+    fi
+    if cmp -s "${here}/gnome-extension/extension.js" "$extdir/extension.js" \
+       && cmp -s "${here}/gnome-extension/metadata.json" "$extdir/metadata.json"; then
+        echo "panel   : already current"
+        return 0
+    fi
+    cp "${here}/gnome-extension/metadata.json" "$extdir/"
+    cp "${here}/gnome-extension/extension.js" "$extdir/"
+    echo "panel   : extension updated"
+    do_restart
+}
+
 do_uninstall() {
     rm -rf "$extdir"
     rm -f "${modedir}/ubuntu.json"
@@ -134,6 +152,7 @@ case "${1:-install}" in
     install)   do_install ;;
     uninstall) do_uninstall ;;
     restart)   do_restart ;;
+    refresh)   do_refresh ;;
     status)    do_status ;;
-    *) die "usage: install-panel.sh [install|uninstall|restart|status]" ;;
+    *) die "usage: install-panel.sh [install|uninstall|restart|refresh|status]" ;;
 esac
